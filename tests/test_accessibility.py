@@ -7,13 +7,15 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from bridge import desktop
 from bridge.accessibility import (
-    AccessibilitySource, Profile, ReadError, Selector, _merge_history, _wechat_login_state, _wechat_time_label,
-    parse_message, urls_in,
+    AccessibilitySource, Profile, ReadError, Selector, WECHAT_AMD64_EN_PRESET, WECHAT_ARM64_EN_PRESET,
+    _merge_history, _wechat_login_state, _wechat_time_label, parse_message, urls_in,
 )
-from bridge.models import Message, message_key
+from bridge.models import Message, Snapshot, message_key
+from bridge.wechat_layout import RowLayout
 from tools import inspect_atspi
 
 
@@ -443,7 +445,77 @@ def test_custom_send_requires_unique_observed_quote_panel_and_proof_it_is_hidden
         source._quote_clear()
 
 
-def test_amd64_requires_custom_selectors_and_reports_read_and_send_preconditions(monkeypatch):
+@pytest.mark.parametrize(("preset", "matching", "mismatching"), [
+    (WECHAT_ARM64_EN_PRESET, "aarch64", "x86_64"),
+    (WECHAT_AMD64_EN_PRESET, "x86_64", "aarch64"),
+])
+def test_builtin_profile_requires_its_architecture_and_package_version(monkeypatch, preset, matching, mismatching):
+    app = FixtureNode("application", name="wechat", native=SimpleNamespace(get_process_id=lambda: 42))
+    monkeypatch.setattr("bridge.accessibility.desktop_nodes", lambda _atspi: iter((app,)))
+    source = AccessibilitySource("fixture group", profile=preset)
+    monkeypatch.setattr("bridge.accessibility.platform.machine", lambda: mismatching)
+    assert source.inspect_profile(object(), "4.1.13.29")["state"] == "profile_architecture_mismatch"
+    monkeypatch.setattr("bridge.accessibility.platform.machine", lambda: matching)
+    assert source.inspect_profile(object(), "4.1.13.28")["state"] == "profile_version_mismatch"
+    assert source.inspect_profile(object(), "4.1.13.29")["state"] == "window_unavailable"
+
+
+def test_amd64_plain_send_requires_a_present_and_hidden_quote_preview(monkeypatch):
+    source = AccessibilitySource("fixture group", profile=WECHAT_AMD64_EN_PRESET)
+    window = FixtureNode("frame")
+    parent = window
+    # Composer path observed on the fixed AMD64 client, including its hidden preview slot.
+    for index in (0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 2, 2):
+        parent.children_nodes = [FixtureNode("filler") for _ in range(index + 1)]
+        parent = parent.child(index)
+    monkeypatch.setattr(source, "_chat", lambda: SimpleNamespace(window=window))
+    with pytest.raises(ReadError, match="quote-preview state"):
+        source._quote_clear()
+
+    preview = FixtureNode("filler", showing=False, states=frozenset({"enabled"}))
+    parent.children_nodes = [FixtureNode("filler"), preview]
+    assert source._quote_clear() is True
+    preview.states = frozenset({"enabled", "visible"})
+    assert source._quote_clear() is False
+    preview.states = frozenset({"defunct"})
+    with pytest.raises(ReadError, match="quote-preview state"):
+        source._quote_clear()
+
+
+async def test_amd64_keeps_visual_ownership_and_crop_without_native_actions(monkeypatch, tmp_path):
+    source = AccessibilitySource("fixture group", profile=WECHAT_AMD64_EN_PRESET,
+                                 media_dir=tmp_path, lookup_sender_names=True, native_image_viewer=True)
+    bounds = (20, 40, 100, 120)
+    row = FixtureNode("list item", name="Image", bounds=bounds)
+    message = Message(chat=source.chat, type="image", text=row.name)
+    snapshot = Snapshot(source.chat, (message,), at_tail=True)
+    source._capture_origin = (snapshot, (row.native,))
+    chat = SimpleNamespace(window=FixtureNode("frame", bounds=(0, 0, 180, 210)),
+                           panel=FixtureNode("list", bounds=bounds), pid=42)
+    monkeypatch.setattr(source, "_chat", lambda: chat)
+    monkeypatch.setattr(source, "_read_chat", lambda _chat: (snapshot, [(row, message, None)]))
+    monkeypatch.setattr(source, "_verify_chat", lambda _chat: None)
+    pixels = Image.new("RGB", bounds[2:], "white")
+    monkeypatch.setattr("bridge.accessibility._capture_pixels", lambda *_: (pixels, bounds))
+    monkeypatch.setattr("bridge.wechat_layout.analyze_message_row", lambda *_: RowLayout(
+        False, (2, 2, 20, 20), (25, 35, 90, 100), (25, 35, 90, 100),
+    ))
+    monkeypatch.setattr("bridge.wechat_layout.image_preview_box", lambda *_: (25, 35, 90, 100))
+
+    def reject_native_action(*_):
+        pytest.fail("AMD64 must not open a contact popup or native photo viewer")
+
+    monkeypatch.setattr(source, "_lookup_group_alias", reject_native_action)
+    monkeypatch.setattr(source, "_capture_native_image", reject_native_action)
+    enriched, = source._capture_messages(snapshot, (0,))
+    assert enriched.is_self is False and enriched.sender is None
+    assert enriched.metadata["ownership_basis"] == "wechat_avatar_side"
+    assert enriched.metadata["capture_quality"] == "wechat_bubble_estimate"
+    assert not await source.quote_matches("fixture")
+    assert not await source.select_quote(snapshot, 0)
+
+
+def test_custom_selectors_on_amd64_report_read_and_send_preconditions(monkeypatch):
     private_text = "private fixture row"
     panel = FixtureNode("list", bounds=(20, 40, 100, 50), children_nodes=[
         FixtureNode("list item", name=private_text, bounds=(20, 65, 100, 25)),
@@ -460,9 +532,6 @@ def test_amd64_requires_custom_selectors_and_reports_read_and_send_preconditions
     connection = SimpleNamespace(close=lambda: None)
     monkeypatch.setitem(sys.modules, "Xlib", SimpleNamespace(display=SimpleNamespace(Display=lambda: connection)))
     monkeypatch.setattr("bridge.accessibility._active_x11", lambda *_: (object(), 123))
-    preset = AccessibilitySource("fixture group", profile="wechat-4.1.13.29-arm64-en")
-    assert preset.inspect_profile(object(), "4.1.13.29")["state"] == "profile_architecture_mismatch"
-
     mapping = profile_fields(package_version="4.1.13.29", body={"path": []}, tail_from_last_row=True,
                              quote_preview={"path": [3], "role": "filler"})
     source = AccessibilitySource("fixture group", profile=mapping)

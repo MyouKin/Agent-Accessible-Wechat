@@ -746,7 +746,7 @@ class CompanionTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
-    def test_agent_uses_scoped_catalog_for_one_read_then_drafts_quote(self):
+    def test_agent_uses_scoped_catalog_for_one_read_and_drafts_quote_when_supported(self):
         search = {
             "name": "search_messages", "description": "Search the configured chat.",
             "inputSchema": {
@@ -760,7 +760,7 @@ class CompanionTests(unittest.TestCase):
         )]
         tools = [*LEGACY_WECHAT_CATALOG, search, *privileged]
 
-        async def exercise(state, read_tool, arguments, *, legacy=False):
+        async def exercise(state, read_tool, arguments, *, legacy=False, native_quote_supported=None):
             now = time.time()
             chat = "合成测试群"
             trigger = message(1, now, "@阿桥 看看当前会话", author_kind="human")
@@ -797,7 +797,10 @@ class CompanionTests(unittest.TestCase):
                     self.assertEqual(dict(request.url.params), scope)
                     return httpx.Response(404 if legacy else 200, json={"tools": tools})
                 if path == "/status":
-                    return httpx.Response(200, json={"chat": chat, "source": {"ready": True}, "send_mode": "manual"})
+                    source_status = {"ready": True}
+                    if native_quote_supported is not None:
+                        source_status["native_quote_supported"] = native_quote_supported
+                    return httpx.Response(200, json={"chat": chat, "source": source_status, "send_mode": "manual"})
                 if path in {"/messages", "/messages/new"}:
                     return httpx.Response(200, json={"messages": [trigger]})
                 if path == "/messages/search":
@@ -860,23 +863,27 @@ class CompanionTests(unittest.TestCase):
                 ("/wechat/agent-tools/wechat_read_current_chat", {"chat": chat, "arguments": arguments})
                 if legacy else (f"/tools/{read_tool}", arguments)
             )
+            quote = {} if native_quote_supported is False else {"quote_message_id": trigger["id"]}
             self.assertEqual(bridge_posts, [
                 expected_read,
                 ("/drafts", {
                     "chat": chat, "author_kind": "llm", "text": "我看到这条了。", "auto_send": False,
-                    "request_id": Job(trigger, "mention", now + 60, None).request_id("draft"), "quote_message_id": 1,
+                    "request_id": Job(trigger, "mention", now + 60, None).request_id("draft"), **quote,
                 }),
             ])
             self.assertIsNone(state.next_job(now))
 
-        for name, arguments, legacy in (
-            ("get_configured_chat_messages", {"limit": 6}, False),
-            ("search_messages", {"q": "合成关键词"}, False),
-            ("get_configured_chat_messages", {"limit": 6}, True),
+        for name, arguments, legacy, native_quote_supported in (
+            ("get_configured_chat_messages", {"limit": 6}, False, None),
+            ("search_messages", {"q": "合成关键词"}, False, None),
+            ("get_configured_chat_messages", {"limit": 6}, True, None),
+            ("get_configured_chat_messages", {"limit": 6}, False, False),
         ):
-            with self.subTest(name=name, legacy=legacy):
+            with self.subTest(name=name, legacy=legacy, native_quote_supported=native_quote_supported):
                 with TemporaryDirectory() as directory, AgentState.open(Path(directory) / "agent.db") as state:
-                    asyncio.run(exercise(state, name, arguments, legacy=legacy))
+                    asyncio.run(exercise(
+                        state, name, arguments, legacy=legacy, native_quote_supported=native_quote_supported,
+                    ))
 
     def test_trusted_bridge_calls_use_the_complete_catalog_without_conversation_scope(self):
         async def exercise():

@@ -399,7 +399,13 @@ class Profile:
 _WECHAT_CHAT = [0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1]
 _WECHAT_TITLE = [*_WECHAT_CHAT, 0, 1, 0, 0, 0, 1, 1, 1, 0]
 _WECHAT_QUOTE_PREVIEW = [*_WECHAT_CHAT, 1, 0, 2, 2, 1]
-_WECHAT_ARM64_EN_PROFILE = {
+WECHAT_ARM64_EN_PRESET = "wechat-4.1.13.29-arm64-en"
+WECHAT_AMD64_EN_PRESET = "wechat-4.1.13.29-amd64-en"
+_WECHAT_EN_ARCHITECTURES = {
+    WECHAT_ARM64_EN_PRESET: {"aarch64", "arm64"},
+    WECHAT_AMD64_EN_PRESET: {"amd64", "x86_64"},
+}
+_WECHAT_EN_PROFILE = {
     "package_version": "4.1.13.29",
     "window": {"role": "frame", "name": "Weixin", "path": [0]},
     "chat_header": {"role": "label", "path": [*_WECHAT_TITLE, 0]},
@@ -418,6 +424,15 @@ _WECHAT_ARM64_EN_PROFILE = {
     "recovery_wheel_ticks": 2,
     "recovery_pages": 6,
 }
+
+
+def wechat_english_profile(version: str | None) -> Profile | None:
+    architecture = platform.machine()
+    if version != _WECHAT_EN_PROFILE["package_version"] or not any(
+        architecture in architectures for architectures in _WECHAT_EN_ARCHITECTURES.values()
+    ):
+        return None
+    return Profile.parse(_WECHAT_EN_PROFILE)
 
 
 @dataclass(frozen=True)
@@ -939,12 +954,14 @@ class AccessibilitySource:
         self._chat_kind: ChatKind | None = None
         self._preset = profile if isinstance(profile, str) else None
         if self._preset is not None:
-            if self._preset != "wechat-4.1.13.29-arm64-en":
+            if self._preset not in _WECHAT_EN_ARCHITECTURES:
                 raise ValueError("unknown AT-SPI profile preset")
-            profile = _WECHAT_ARM64_EN_PROFILE
+            profile = _WECHAT_EN_PROFILE
+            if self._preset == WECHAT_AMD64_EN_PRESET:
+                profile = {**profile, "quote_preview": {"path": _WECHAT_QUOTE_PREVIEW, "role": "filler"}}
         self.profile = Profile.parse(profile) if profile else None
-        self.lookup_sender_names = lookup_sender_names and self._preset is not None
-        self.native_image_viewer = native_image_viewer and self._preset is not None
+        self.lookup_sender_names = lookup_sender_names and self._preset == WECHAT_ARM64_EN_PRESET
+        self.native_image_viewer = native_image_viewer and self._preset == WECHAT_ARM64_EN_PRESET
         self.poll_interval = poll_interval
         self.media_dir = media_dir
         self.desktop_lock = desktop_lock if desktop_lock is not None else asyncio.Lock()
@@ -1081,6 +1098,7 @@ class AccessibilitySource:
             "source": "accessibility", "state": self._state, "ready": self._state == "ready",
             "chat": self.chat, "wechat_version": self._version, "events": bool(self._registered),
             "at_tail": self._at_tail, "target_kind": self._target_kind, "chat_kind": self._chat_kind,
+            "native_quote_supported": self._preset == WECHAT_ARM64_EN_PRESET,
         }
 
     def _chat(self) -> _Chat:
@@ -1101,7 +1119,7 @@ class AccessibilitySource:
             raise _Unavailable("profile_required")
         if profile.package_version != self._version:
             raise _Unavailable("profile_version_mismatch")
-        if self._preset and platform.machine() not in {"aarch64", "arm64"}:
+        if self._preset and platform.machine() not in _WECHAT_EN_ARCHITECTURES[self._preset]:
             raise _Unavailable("profile_architecture_mismatch")
 
         window = profile.window.one(app)
@@ -1431,7 +1449,7 @@ class AccessibilitySource:
         return state == "clear"
 
     def _quote_preview_state(self, window: Node) -> str:
-        if self._preset is not None:
+        if self._preset == WECHAT_ARM64_EN_PRESET:
             return "clear" if wechat_quote_preview(window) is None else "present"
         selector = self.profile.quote_preview if self.profile is not None else None
         if selector is None:
@@ -1446,7 +1464,7 @@ class AccessibilitySource:
         return "present" if states & {"showing", "visible"} else "clear"
 
     async def quote_matches(self, text: str) -> bool:
-        if self._preset is None:
+        if self._preset != WECHAT_ARM64_EN_PRESET:
             return False
         return await self._call(self._quote_matches, text)
 
@@ -1463,7 +1481,7 @@ class AccessibilitySource:
         return preview == accessible_text(text) or preview.endswith(": " + accessible_text(text))
 
     async def select_quote(self, snapshot: Snapshot, index: int, *, allow_own: bool = False) -> bool:
-        if self._preset is None:
+        if self._preset != WECHAT_ARM64_EN_PRESET:
             return False
         return await self._call(self._select_quote, snapshot, index, allow_own)
 

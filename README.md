@@ -4,7 +4,7 @@
 
 单会话采集、陪伴回复与[微信桌面操作](#微信桌面工具与登录)共用一个官方客户端。Bridge 为 Agent 的 HTTP API 和可选的 MCP 端点提供同一份工具目录。项目自身负责消息归属、同步、记忆、回复决策和发送校验。
 
-当前内置无障碍配置适用于微信 `4.1.13.29` 的 ARM64 英文界面。AMD64、其他语言和其他版本按实际无障碍树配置。登录后的采集、发送和原生操作验收范围见[验证记录](#验证记录)。
+当前内置无障碍配置适用于微信 `4.1.13.29` 的 ARM64 和 AMD64 英文界面。其他语言和版本按实际无障碍树配置。登录后的采集、发送和原生操作验收范围见[验证记录](#验证记录)。
 
 ```mermaid
 flowchart LR
@@ -125,7 +125,7 @@ docker compose exec bridge dpkg-query -W wechat
 
 JSON 树包含角色、名称、描述、接口、边界、状态以及客户端提供的 Text、Image、Hypertext 和 Hyperlink 信息。`--all` 列出所有应用树，`--app` 可指定应用名。诊断文件可能包含聊天和成员资料，分享前使用 `--redact` 并检查内容。导出命令要求目标文件尚不存在。
 
-在 `config.local.yaml` 配置无障碍映射。仅在安装包、架构和桌面语言匹配时使用 `accessibility_profile: wechat-4.1.13.29-arm64-en`。其他环境可先保持 `accessibility_profile: null`，完成诊断后填写自定义映射。配置保存后运行 `docker compose up -d --force-recreate --wait bridge`，再选择会话并检查 `/status`。
+在 `config.local.yaml` 配置无障碍映射。使用与安装包、架构和桌面语言对应的 `accessibility_profile`，英文客户端可选 `wechat-4.1.13.29-arm64-en` 或 `wechat-4.1.13.29-amd64-en`。原生引用、联系人卡片和照片查看器操作目前由 ARM64 配置提供。其他环境可先保持 `accessibility_profile: null`，完成诊断后填写自定义映射。配置保存后运行 `docker compose up -d --force-recreate --wait bridge`，再选择会话并检查 `/status`。
 
 | 配置 | 说明 |
 | --- | --- |
@@ -209,7 +209,7 @@ curl --fail --silent --get -H "Authorization: Bearer $BRIDGE_TOKEN" \
 | `GET /memories` / `POST /memories` | 读取或保存当前会话的长期记忆。 |
 | `GET /tools` / `POST /tools/{name}` | 获取共享工具目录，或传入该工具的 JSON 参数并执行。查询参数 `scope=conversation` 将目录和执行限定为当前会话的只读工具，可一并传入 `session_key`。 |
 
-原生引用通过本地 `quote_message_id` 选择目标。Bridge 会核实可见文本行和当前会话，调用微信自己的引用菜单，再回读引用预览。目标不可见、重复候选或预览不符时，发送不会继续。模型只能选择进入其上下文且符合条件的真人文本作为原生引用目标。
+原生引用通过本地 `quote_message_id` 选择目标。Bridge 会核实可见文本行和当前会话，调用微信自己的引用菜单，再回读引用预览。目标不可见、重复候选或预览不符时，发送不会继续。模型只能选择进入其上下文且符合条件的真人文本作为原生引用目标。若当前无障碍配置只支持普通文本，Agent 会将模型的引用回复保存为普通文本草稿。
 
 Agent 或其他受信本机程序使用 Bridge API 的 `BRIDGE_TOKEN` 访问 `GET /tools` 和 `POST /tools/{name}`。例如查询工具目录并调用微信状态。
 
@@ -334,7 +334,7 @@ IFS= read -r session_key
 uv run --locked --env-file .env --env-file .env.agent python -m agent --set-session "$session_key"
 ```
 
-Bridge 打开唯一同名的搜索结果，核对标题、类型和消息尾部，再把选择持久化到 `bridge-data` 卷中的 SQLite。会话类型从 `unknown` 确认为群聊或私聊后，返回的本地选择键可能变化。后续 HTTP 请求使用 `/status` 中的 `active_session.key`。原生 ID 缺失时，本地会话键基于标题与类型。Bridge 会拒绝检测到的同名歧义或无法核验的会话，失败时保留上次保存的选择。在内置 ARM64 英文配置下，已选定会话的标题若在微信侧栏同时出现两条可识别记录，Bridge 会阻止受控发送。读取仍依据标题和类型。界面未暴露的同名会话或后来复用的名称，可能无法区分。
+Bridge 打开唯一同名的搜索结果，核对标题、类型和消息尾部，再把选择持久化到 `bridge-data` 卷中的 SQLite。会话类型从 `unknown` 确认为群聊或私聊后，返回的本地选择键可能变化。后续 HTTP 请求使用 `/status` 中的 `active_session.key`。原生 ID 缺失时，本地会话键基于标题与类型。Bridge 会拒绝检测到的同名歧义或无法核验的会话，失败时保留上次保存的选择。在内置英文配置下，已选定会话的标题若在微信侧栏同时出现两条可识别记录，Bridge 会阻止受控发送。读取仍依据标题和类型。界面未暴露的同名会话或后来复用的名称，可能无法区分。
 
 首次选择时也可直接启动 Agent。准备好 `.env.agent` 后运行。
 
@@ -466,9 +466,9 @@ docker buildx build --check -f docker/Dockerfile .
 | ARM64 / Apple Silicon Colima 历史实测 | 已在英文微信 `4.1.13.29` 验证构建、noVNC 鉴权、手机登录、登录后 AT-SPI2 树、真实群消息同步、中文和 Emoji 发送、原生引用、有限历史回溯，以及容器重建后数据卷保留。 |
 | ARM64 微信工具集成 | 在离线容器中验证 Bridge 的 AT-SPI 与 65 个上游工具共用同一微信 PID。HTTP 和 MCP 列出相同的 78 项工具，已调用状态、无障碍树和截图。真实登录后的桌面操作待验收。 |
 | AMD64 / Rosetta | 曾用官方 `4.1.13.29` 构建镜像，验证未登录启动、AT-SPI 应用注册、noVNC 页面、未鉴权 API 返回 `401` 及鉴权状态请求。 |
-| Ubuntu x86_64 原生 Docker | 上一版本 CI 验证了原生镜像和未登录桌面。本次通过 AMD64 Dockerfile 静态检查和锁定的 Python 依赖安装验证，完整镜像运行及登录后收发待验收。 [GitHub Actions 检查](https://github.com/MyouKin/Agent-Accessible-Wechat/actions/workflows/checks.yml) |
+| Ubuntu x86_64 原生 Docker | 验证了官方 `4.1.13.29` 英文客户端、容器启动、Bridge 健康检查、noVNC、扫码登录和登录后群聊无障碍树。原生发送单独验收。 [GitHub Actions 检查](https://github.com/MyouKin/Agent-Accessible-Wechat/actions/workflows/checks.yml) |
 | 运行时会话选择与私聊 | 合成桌面和 Bridge/Agent 测试覆盖列表、同名切换校验、选择恢复、隔离查询与私聊草稿。真实账号登录后的会话发现、恢复和私聊收发待实机验收。 |
-| 模型链路 | 本地合成测试覆盖模型协议、上下文、媒体、草稿、路由和去重。ARM64 测试群曾用 DeepSeek 选择已见文本并确认微信原生引用。RTX 5080 / llama.cpp 组合待实机验收。 |
+| 模型链路 | 本地合成测试覆盖模型协议、上下文、媒体、草稿、路由和去重。ARM64 测试群曾用 DeepSeek 选择已见文本并确认微信原生引用。RTX 5080 上的小飞鱼 12B v4 已通过本机和服务器经 SSH 转发的合成对话验证。 |
 
 已核实的 ARM64 与 AMD64 安装包版本为 `4.1.13.29`。可在 `.env` 配置 `WECHAT_ARM64_SHA256` 和 `WECHAT_AMD64_SHA256` 固定已核验的散列。上游更新后，重新检查包版本和实际无障碍树。 [腾讯 Linux 微信下载](https://linux.weixin.qq.com/)
 

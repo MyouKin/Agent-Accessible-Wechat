@@ -1360,6 +1360,7 @@ class Companion:
         self.session_key: str | None = None
         self.session_kind: str | None = None
         self.ready = False
+        self.native_quote_supported = True
         self.scope = 0
 
     def status_is_ready(self, status: dict, chat: str) -> bool:
@@ -1375,6 +1376,8 @@ class Companion:
         self.ready = False
         binding = status_session(status)
         self.ready = binding == (self.session_key, self.session_kind) and self.status_is_ready(status, chat)
+        if self.ready:
+            self.native_quote_supported = (status.get("source") or {}).get("native_quote_supported", True) is True
         return self.ready
 
     async def poll_once(self, now: float) -> None:
@@ -1658,6 +1661,9 @@ class Companion:
         if decision.reply and (
             not self.settings.allow_unattributed_mentions or not contains_mention(decision.reply, self.settings.mentions)
         ):
+            if decision.quote_message_id is not None and not self.native_quote_supported:
+                decision = replace(decision, quote_message_id=None)
+                self.state.prepare(job, decision)
             if decision.quote_message_id is not None:
                 quote = job.message if decision.quote_message_id == job.id else await self.current_message(
                     job.message["chat"], decision.quote_message_id, session_key=session_key,

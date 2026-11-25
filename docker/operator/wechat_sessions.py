@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import platform
 import re
 import time
 
-from bridge.accessibility import Node, Profile, _WECHAT_ARM64_EN_PROFILE, client_version, runtime
+from bridge.accessibility import Node, client_version, runtime, wechat_english_profile
 
 
 SEARCH_TYPES = {
@@ -47,9 +46,7 @@ def select_result(rows, name: str, kind: str):
 class SessionNavigator:
     def __init__(self, wx, a11y, xinput):
         self.wx, self.a11y, self.xinput = wx, a11y, xinput
-        self.profile = None
-        if platform.machine() in {"aarch64", "arm64"} and client_version() == "4.1.13.29":
-            self.profile = Profile.parse(_WECHAT_ARM64_EN_PROFILE)
+        self.profile = wechat_english_profile(client_version())
 
     def _current(self, main):
         if self.profile is not None and self.a11y.name(main) == "Weixin":
