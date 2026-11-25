@@ -1,0 +1,15 @@
+# Set an exact group title after confirming the client exposes the group header.
+chat: ""
+source: accessibility
+poll_interval: 0.5
+data_dir: /data
+send_mode: manual
+# Confirm the client's configured key combination before enabling sending.
+send_key: Return
+mcp_enabled: false
+# An exact package version and selectors can be filled after logged-in inspection.
+accessibility_profile: null
+# Enable supported native profile-card lookups for newly observed rows.
+lookup_sender_names: false
+# Opt in to capturing photos from the verified native viewer.
+native_image_viewer: false

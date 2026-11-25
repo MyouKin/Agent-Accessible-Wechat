@@ -1,0 +1,85 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Python tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.9"
+      - run: uv sync --locked --python 3.12 --extra mcp
+      - run: uv run --locked --extra mcp pytest -q
+
+  desktop:
+    name: Docker desktop (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the native image
+        run: docker build -f docker/Dockerfile -t agent-accessible-wechat:ci .
+      - name: Start a private desktop with the sample configuration
+        run: |
+          docker run --detach --name aaw-ci --network none --cap-drop ALL \
+            --security-opt no-new-privileges:true --shm-size 256m \
+            -e BRIDGE_TOKEN=ci-smoke-only -e VNC_PASSWORD=smoke123 \
+            agent-accessible-wechat:ci
+      - name: Verify the WeChat package, Bridge API, noVNC and AT-SPI
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          expected=$(docker exec aaw-ci dpkg-query -W -f='${Architecture}' wechat)
+          test "$expected" = "$EXPECTED_ARCH"
+          for attempt in {1..45}; do
+            if docker exec aaw-ci curl -fsS --max-time 2 http://127.0.0.1:8765/health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec aaw-ci curl -fsS http://127.0.0.1:8765/health
+          docker exec aaw-ci curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null
+          code=$(docker exec aaw-ci curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/status)
+          test "$code" = 401
+          docker exec aaw-ci curl -fsS -H 'Authorization: Bearer ci-smoke-only' \
+            http://127.0.0.1:8765/status | python3 -c 'import json,sys; assert json.load(sys.stdin)["source"]["ready"] is False'
+          for attempt in {1..30}; do
+            if docker exec aaw-ci sh -c '. "$XDG_RUNTIME_DIR/bridge-session.env"; python -m tools.inspect_atspi --redact --max-nodes 15 --json -' \
+              | python3 -c 'import json,sys; r=json.load(sys.stdin); sys.exit(0 if r["trees"] and not r["errors"] else 1)'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+      - name: Collect logs on failure
+        if: failure()
+        run: docker logs aaw-ci || true
+      - name: Remove the isolated test container
+        if: always()
+        run: docker rm -f aaw-ci || true

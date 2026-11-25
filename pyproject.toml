@@ -1,0 +1,39 @@
+[project]
+name = "agent-accessible-wechat"
+version = "0.1.0"
+description = "Accessible bridge and companion agent for the official Linux WeChat desktop client"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "mss>=10,<11",
+    "pillow>=11,<13",
+    "pydantic>=2.10,<3",
+    "pyyaml>=6,<7",
+    "python-xlib>=0.33,<1; sys_platform == 'linux'",
+    "uvicorn>=0.34,<1",
+]
+
+[project.urls]
+Repository = "https://github.com/MyouKin/Agent-Accessible-Wechat"
+Issues = "https://github.com/MyouKin/Agent-Accessible-Wechat/issues"
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.17,<2"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["bridge", "tools"]
+py-modules = ["agent"]
