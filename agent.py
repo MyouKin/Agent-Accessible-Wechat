@@ -407,7 +407,6 @@ class AgentState:
         with self.db:
             cursor = self.get("cursor", 0)
             offer = self.get("offer", {})
-            normal_ready = self.normal_ready(settings, now)
             candidates = []
             for message in sorted(messages, key=lambda msg: msg["id"]):
                 if message["id"] <= cursor:
@@ -429,7 +428,7 @@ class AgentState:
                 if (message.get("metadata") or {}).get("baseline"):
                     continue
                 reason = self.trigger_reason(message, offer, settings, observed, session_kind=session_kind)
-                if reason and (reason in URGENT_REASONS or normal_ready):
+                if reason:
                     candidates.append((TRIGGER_PRIORITY[reason], cursor, reason, message, observed))
             selected = [candidate for candidate in candidates if candidate[2] in REQUIRED_REPLY_REASONS]
             if candidates and not selected:
@@ -440,6 +439,16 @@ class AgentState:
                     VALUES (?,?,?,?,?,?)
                 """, (trigger_id, json.dumps(message, ensure_ascii=False), reason, priority,
                       observed + settings.max_message_age, cursor))
+                if reason not in URGENT_REASONS:
+                    self.db.execute("""
+                        DELETE FROM pending_jobs
+                        WHERE decision IS NULL AND priority < :urgent
+                          AND id NOT IN (
+                              SELECT id FROM pending_jobs
+                              WHERE decision IS NULL AND priority < :urgent AND expires_at > :now
+                              ORDER BY priority DESC, id DESC LIMIT 1
+                          )
+                    """, {"urgent": TRIGGER_PRIORITY["unattributed-mention"], "now": now})
             self.set("cursor", cursor)
 
     def normal_ready(self, settings: Settings, now: float) -> bool:
@@ -493,13 +502,20 @@ class AgentState:
         return Job(json.loads(message), reason, expires_at, Decision(**json.loads(decision)) if decision else None,
                    context_through_id)
 
-    def mark_decision_started(self, job: Job, now: float) -> None:
+    def mark_decision_started(self, job: Job, now: float) -> bool:
         with self.db:
-            if job.reason not in URGENT_REASONS:
-                self.set("last_normal_decision_at", now)
+            if now >= job.expires_at:
+                return False
             if job.reason not in REQUIRED_REPLY_REASONS:
                 # Optional participation need not be attempted again after an interrupted inference.
-                self.db.execute("UPDATE pending_jobs SET decision='{}' WHERE id=?", (job.id,))
+                marked = self.db.execute(
+                    "UPDATE pending_jobs SET decision='{}' WHERE id=? AND decision IS NULL", (job.id,),
+                ).rowcount
+                if not marked:
+                    return False
+            if job.reason not in URGENT_REASONS:
+                self.set("last_normal_decision_at", now)
+            return True
 
     def prepare(self, job: Job, decision: Decision) -> None:
         payload = json.dumps({
@@ -1662,8 +1678,7 @@ class Companion:
         required = job.reason in REQUIRED_REPLY_REASONS
         needs_decision = decision is None or (required and not decision.reply)
         if decision is None and job.reason not in URGENT_REASONS and not self.state.normal_ready(self.settings, now):
-            self.state.finish(job, supersede=False)
-            return 0
+            return .5
         message = await self.verify_job_message(job, session_key=session_key)
         if self.scope != scope:
             return 0
@@ -1685,7 +1700,8 @@ class Companion:
                 tools, legacy = await self.conversation_catalog(job.message["chat"], session_key=session_key)
                 if self.scope != scope:
                     return 0
-            self.state.mark_decision_started(job, time.time())
+            if not self.state.mark_decision_started(job, time.time()):
+                return 0
             try:
                 if tools:
                     async def call_tool(name: str, arguments: dict) -> object:

@@ -605,19 +605,20 @@ class CompanionTests(unittest.TestCase):
                 self.assertEqual(state.next_job(now).decision, Decision())
                 state.finish(first)
                 state.collect([message(2, now + 10, "地铁人真多")], chat, settings, now + 10)
-                self.assertIsNone(state.next_job(now + 10))
+                self.assertEqual(state.next_job(now + 10).id, 2)
+                self.assertFalse(state.normal_ready(settings, now + 10))
 
             with AgentState.open(state_file) as state:
                 agent_text = "@群测试昵称 Agent 自己说的话"
                 model = message(3, now + 20, agent_text, is_self=True, author_kind="llm")
                 state.collect([model], chat, settings, now + 20)
-                self.assertIsNone(state.next_job(now + 20))
+                self.assertEqual(state.next_job(now + 20).id, 2)
                 uncertain = message(
                     4, now + 25, "收到", is_self=True, author_kind="human", reply_text="收到",
                     quote={"text": agent_text, "author_label": "本账号", "author_kind": "unknown"},
                 )
                 state.collect([uncertain], chat, settings, now + 25)
-                self.assertIsNone(state.next_job(now + 25))
+                self.assertEqual(state.next_job(now + 25).id, 4)
                 mention = message(5, now + 30, "@群测试昵称 你怎么看", author_kind="human")
                 quote = message(
                     6, now + 31, "那我照这个改", is_self=True, author_kind="human", reply_text="那我照这个改",
@@ -639,6 +640,75 @@ class CompanionTests(unittest.TestCase):
                 self.assertIsNone(state.next_job(now + 61))
                 state.collect([message(8, now + 62, "有新消息")], chat, settings, now + 62)
                 self.assertEqual(state.next_job(now + 62).reason, "selective")
+
+    def test_optional_candidate_runs_after_cooldown_without_a_new_message(self):
+        async def exercise(state, first_decision, ready_after):
+            started = clock = time.time()
+            chat = "合成测试群"
+            rows = []
+            settings = Settings(min_reply_interval=90, wechat_tools=False)
+
+            async def get(path, **params):
+                if path == "status":
+                    return {"chat": chat, "source": {"ready": True}, "send_mode": "manual"}
+                if path == "messages/new":
+                    return {"messages": [row for row in rows if row["id"] > params["after_id"]][:params["limit"]]}
+                if path == "messages":
+                    return {"messages": rows[-params["limit"]:]}
+                if path == "messages/search":
+                    return {"messages": []}
+                self.assertEqual(path, "memories")
+                return {"memories": []}
+
+            bridge = AsyncMock()
+            bridge.get.side_effect = get
+            bridge.post.return_value = {"id": 1, "status": "pending"}
+            model = AsyncMock()
+            model.decide.side_effect = [first_decision, Decision()]
+            companion = Companion(settings, bridge, model, state)
+            with patch("agent.time.time", side_effect=lambda: clock):
+                await companion.poll_once(clock)
+                rows.append(message(1, clock, "第一条普通消息", author_kind="human"))
+                await companion.poll_once(clock)
+                await companion.respond_once(clock)
+                for row_id, offset in ((2, 10), (3, 30)):
+                    clock = started + offset
+                    rows.append(message(row_id, clock, "冷却中的普通消息", author_kind="human"))
+                    await companion.poll_once(clock)
+                    await companion.respond_once(clock)
+                clock = started + ready_after - .1
+                await companion.respond_once(clock)
+                self.assertEqual(model.decide.await_count, 1)
+                self.assertEqual(state.next_job(clock).id, 3)
+
+                clock = started + ready_after
+                await companion.respond_once(clock)
+                await companion.respond_once(clock + 1)
+            jobs = [call.args[0] for call in model.decide.await_args_list]
+            self.assertEqual([(job.id, job.reason) for job in jobs], [(1, "selective"), (3, "selective")])
+            self.assertEqual(state.get("last_normal_decision_at"), started + ready_after)
+            self.assertIsNone(state.next_job(clock))
+
+        for first_decision, ready_after in ((Decision(), 60), (Decision("合成回复"), 90)):
+            with self.subTest(ready_after=ready_after):
+                with TemporaryDirectory() as directory, AgentState.open(Path(directory) / "agent.db") as state:
+                    asyncio.run(exercise(state, first_decision, ready_after))
+
+    def test_superseded_or_expired_optional_candidate_cannot_start_a_decision(self):
+        now = time.time()
+        chat = "合成测试群"
+        settings = Settings(max_message_age=30)
+        with TemporaryDirectory() as directory, AgentState.open(Path(directory) / "agent.db") as state:
+            state.bind_chat(chat, 0)
+            state.collect([message(1, now, "旧候选")], chat, settings, now)
+            old = state.next_job(now)
+            state.collect([message(2, now + 10, "新候选")], chat, settings, now + 10)
+            self.assertFalse(state.mark_decision_started(old, now + 11))
+            current = state.next_job(now + 11)
+            self.assertEqual(current.id, 2)
+            self.assertFalse(state.mark_decision_started(current, now + 40))
+            self.assertIsNone(state.get("last_normal_decision_at"))
+            self.assertIsNone(state.next_job(now + 40))
 
     def test_readiness_rechecked_before_inference_and_post(self):
         async def exercise(state):
