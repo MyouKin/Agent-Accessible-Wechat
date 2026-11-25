@@ -102,6 +102,33 @@ def test_session_search_requires_one_exact_result_and_proves_its_kind():
             sessions.select_result([*rows, ("完整群名", competing_kind, other)], "完整群名", "group")
 
 
+@pytest.mark.parametrize(("name", "kind", "fragment"), [
+    ("示例·Sample Room_尾", "group", "Sample Room"),
+    ("甲（样例联系人）", "private", "样例联系人"),
+])
+def test_session_search_uses_longest_title_fragment_for_one_typed_and_one_unknown_row(name, kind, fragment):
+    rows = [(name, kind, object()), (name, "unknown", object()),
+            (name + "其他", kind, object()), (name, None, object())]
+    with pytest.raises(sessions.SessionSearchError):
+        sessions.select_result(rows, name, kind)
+    assert sessions.search_fragment(rows, name, kind) == fragment
+
+
+@pytest.mark.parametrize(("name", "kind", "exact_kinds"), [
+    ("样例·完整名称", "group", ("group",)),
+    ("样例·完整名称", "group", ("group", "group", "unknown")),
+    ("样例·完整名称", "group", ("group", "private")),
+    ("样例·完整名称", "group", ("group", "unknown", "unknown")),
+    ("样例·完整名称", "private", ("group", "unknown")),
+    ("样例·完整名称", "unknown", ("group", "unknown")),
+    ("甲·乙", "group", ("group", "unknown")),
+    ("完整名称", "group", ("group", "unknown")),
+])
+def test_session_search_requires_a_single_typed_match_and_a_shorter_fragment(name, kind, exact_kinds):
+    rows = [(name, exact_kind, object()) for exact_kind in exact_kinds]
+    assert sessions.search_fragment(rows, name, kind) is None
+
+
 def test_session_inventory_waits_for_login_before_inspecting_sidebar(monkeypatch):
     monkeypatch.setattr(sessions, "client_version", lambda: None)
     navigator = sessions.SessionNavigator(SimpleNamespace(main_frame=lambda: None), None, None)

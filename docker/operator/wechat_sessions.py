@@ -43,6 +43,17 @@ def select_result(rows, name: str, kind: str):
     return result_kind, node
 
 
+def search_fragment(rows, name: str, kind: str) -> str | None:
+    """Retry a duplicated full-title result using a shorter search query."""
+    if kind not in {"group", "private"}:
+        return None
+    exact = [candidate_kind for title, candidate_kind, _ in rows if title == name and candidate_kind is not None]
+    if len(exact) != 2 or kind not in exact or "unknown" not in exact:
+        return None
+    fragment = max((part.strip() for part in re.split(r"[^\w\s]+|_+", name)), key=len)
+    return fragment if len(fragment) >= 2 and fragment != name else None
+
+
 class SessionNavigator:
     def __init__(self, wx, a11y, xinput):
         self.wx, self.a11y, self.xinput = wx, a11y, xinput
@@ -179,9 +190,9 @@ class SessionNavigator:
             lambda: "focused" in self.a11y.states(field), timeout=0.6,
         ):
             raise SessionSearchError("The client's search field did not receive focus")
-        try:
-            if not editable.setTextContents(name) or not self.a11y.wait_for(
-                lambda: text.getText(0, -1) == name, timeout=0.6,
+        def search(query):
+            if not editable.setTextContents(query) or not self.a11y.wait_for(
+                lambda: text.getText(0, -1) == query, timeout=0.6,
             ):
                 raise SessionSearchError("The client's search field did not accept the title")
 
@@ -194,7 +205,7 @@ class SessionNavigator:
 
             def settled_results():
                 nonlocal last_rows, changed_at
-                if self._popups() != [popup] or text.getText(0, -1) != name:
+                if self._popups() != [popup] or text.getText(0, -1) != query:
                     return False
                 rows = self._search_results(popup)
                 fingerprint = [(title, candidate_kind) for title, candidate_kind, _ in rows]
@@ -202,9 +213,19 @@ class SessionNavigator:
                     last_rows, changed_at = fingerprint, time.monotonic()
                 return rows if time.monotonic() - changed_at >= 0.5 else False
 
-            rows = self.a11y.wait_for(settled_results, timeout=3)
-            result_kind, item = select_result(rows or (), name, kind)
-            if self._popups() != [popup] or select_result(self._search_results(popup), name, kind) != (result_kind, item):
+            return popup, self.a11y.wait_for(settled_results, timeout=3) or ()
+
+        query = name
+        try:
+            popup, rows = search(query)
+            if fragment := search_fragment(rows, name, kind):
+                if self._popups() != [popup] or text.getText(0, -1) != query or not self._active_pid():
+                    raise SessionSearchError("The native search results changed before retry")
+                query = fragment
+                popup, rows = search(query)
+            result_kind, item = select_result(rows, name, kind)
+            if (self._popups() != [popup] or text.getText(0, -1) != query
+                    or select_result(self._search_results(popup), name, kind) != (result_kind, item)):
                 raise SessionSearchError("The native search results changed before activation")
             if not self._activate(popup, item):
                 raise SessionSearchError("The exact result could not be safely activated")
@@ -222,7 +243,7 @@ class SessionNavigator:
             return {"name": name, "kind": result_kind, "native_id": None}
         finally:
             try:
-                if text.getText(0, -1) == name and self.wx.main_frame() == main and self._active_pid():
+                if text.getText(0, -1) == query and self.wx.main_frame() == main and self._active_pid():
                     if editable.setTextContents("") and "focused" in self.a11y.states(field):
                         self.xinput.key("Escape")
             except (RuntimeError, NotImplementedError):
