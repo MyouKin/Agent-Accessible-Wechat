@@ -98,10 +98,13 @@ curl --fail --silent -H "Authorization: Bearer $BRIDGE_TOKEN" "$bridge_url/statu
 
 API 和 noVNC 默认发布到宿主机环回。`BRIDGE_PORT` 和 `NOVNC_PORT` 可在 `.env` 中改变宿主机端口。VNC 密码要求 8 位 ASCII 字母或数字。Bridge API 使用独立 Bearer 令牌。
 
-在远程 Ubuntu 主机上跑 Bridge 时，可从本地通过 SSH 映射 noVNC 端口。
+### 通过 SSH 打开 noVNC
+
+Bridge 在远程主机上运行时，从浏览器所在主机转发 noVNC。用实际 SSH 账号和主机名替换 `user@bridge.lan`。若修改了 `NOVNC_PORT`，将命令末端的 `6080` 换成设置的端口。
 
 ```bash
-ssh -N -L 16080:127.0.0.1:6080 user@server
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:16080:127.0.0.1:6080 user@bridge.lan
 ```
 
 连接后打开 [本地转发的 noVNC](http://127.0.0.1:16080/vnc.html?autoconnect=1&resize=scale)。
@@ -270,7 +273,7 @@ fi
 ```dotenv
 LLM_PROVIDER_ORDER=gemma,deepseek
 LLM_GEMMA_PROTOCOL=ollama
-LLM_GEMMA_BASE_URL=http://192.168.8.100:11434
+LLM_GEMMA_BASE_URL=http://inference.lan:11434
 LLM_GEMMA_MODEL=gemma4
 LLM_GEMMA_TIMEOUT_SECONDS=30
 LLM_DEEPSEEK_BASE_URL=https://api.deepseek.com
@@ -291,12 +294,36 @@ LLM_DEEPSEEK_REASONING_EFFORT=none
 
 `LLM_PROVIDER_ORDER` 留空时，按原方式使用单一 Chat Completions 提供方，配置 `LLM_BASE_URL`、`LLM_MODEL` 和可选的 `LLM_API_KEY`。优先级列表中只要有一个非环回地址，处理真实会话前就需要设置 `AGENT_DATA_CONSENT=true`。
 
-### 首次选择会话
+### 部署拓扑
 
-微信登录后，从宿主机列出会话。列表和单独切换使用 `.env` 中的 Bridge 令牌，无需模型配置。若修改了宿主机 `BRIDGE_PORT`，将 `AGENT_BRIDGE_URL` 放入 `.env` 或预先导出，以便下面的命令连接正确端口。
+Bridge 用 Docker Compose 运行，Agent 用宿主机上的 uv 运行。按 Agent 实际可访问的地址在 `.env.agent` 设置 `AGENT_BRIDGE_URL` 和模型地址。变更地址或模型优先级后重启 Agent。下文的主机名、SSH 账号和监听端口均可替换。
+
+**Bridge、Agent 和推理同机。** 保留 `AGENT_BRIDGE_URL=http://127.0.0.1:8765`，若修改了 `BRIDGE_PORT`，使用对应端口。推理服务可监听环回，Agent 的模型地址例如 `http://127.0.0.1:8080/v1`。
+
+**Bridge 和 Agent 同机，推理在另一台机器。** 局域网直连时，将模型地址设为推理服务的可达地址，例如 `http://inference.lan:8080/v1`，真实会话按上节设置 `AGENT_DATA_CONSENT`。若推理服务只监听自己的环回，可在推理主机上发起 SSH 反向转发。以下示例在 Agent 主机的 `127.0.0.1:18080` 接收请求，将对应的模型地址设为 `http://127.0.0.1:18080/v1`。
 
 ```bash
-uv run --locked --env-file .env python -m agent --list-sessions
+ssh -N -o ExitOnForwardFailure=yes \
+  -R 127.0.0.1:18080:127.0.0.1:8080 user@agent.lan
+```
+
+**Bridge 和 Agent 分开部署。** 在 Agent 主机上发起 SSH 本地转发，把 `.env.agent` 中的 `AGENT_BRIDGE_URL` 设为 `http://127.0.0.1:18765`。在 Agent 主机的私有 `.env` 中设置与 Bridge 相同的 `BRIDGE_TOKEN`。如果 Bridge 主机使用自定义 `BRIDGE_PORT`，替换命令末端的 `8765`。模型仍可按前两种方式接入。
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:18765:127.0.0.1:8765 user@bridge.lan
+```
+
+SSH 服务须允许对应方向的端口转发，运行时保持 SSH 连接。Bridge API 和 noVNC 默认在 Bridge 主机上绑定环回。远程扫码时，从浏览器所在主机[另行转发 noVNC](#通过-ssh-打开-novnc)，使用 `NOVNC_PORT` 对应的宿主机端口。 [OpenBSD ssh 手册](https://man.openbsd.org/ssh)
+
+在 Agent 主机访问 `AGENT_BRIDGE_URL` 下的 `/health` 验证 Bridge 可达，再用带令牌的 `/status` 核对微信采集状态。[合成对话 `--demo`](#启动和模型上下文)用于测试 Agent 到模型的链路。若配置了多个提供方，可检查回退日志，或临时只配置一个提供方逐个验证。
+
+### 首次选择会话
+
+微信登录后，从 Agent 主机列出会话。列表和单独切换使用 `.env` 中的 Bridge 令牌和 `.env.agent` 中的 `AGENT_BRIDGE_URL`，可在配置模型前执行。
+
+```bash
+uv run --locked --env-file .env --env-file .env.agent python -m agent --list-sessions
 ```
 
 表格包含名称、会话类型、微信原生 ID、本地选择键和活跃状态。当前驱动只枚举微信侧栏暴露的会话，最多检查 200 个节点，跳过折叠入口，因此会报告列表不完整。缺少类型证据时显示 `unknown`，原生 ID 无可核验证据时显示 `unavailable`。选择时使用表格里的 `Local key`。如未看到某个会话，可先在 noVNC 里将其显示在侧栏，再重新列出。
@@ -304,7 +331,7 @@ uv run --locked --env-file .env python -m agent --list-sessions
 ```bash
 printf '输入表格中的 Local key '
 IFS= read -r session_key
-uv run --locked --env-file .env python -m agent --set-session "$session_key"
+uv run --locked --env-file .env --env-file .env.agent python -m agent --set-session "$session_key"
 ```
 
 Bridge 打开唯一同名的搜索结果，核对标题、类型和消息尾部，再把选择持久化到 `bridge-data` 卷中的 SQLite。会话类型从 `unknown` 确认为群聊或私聊后，返回的本地选择键可能变化。后续 HTTP 请求使用 `/status` 中的 `active_session.key`。原生 ID 缺失时，本地会话键基于标题与类型。Bridge 会拒绝检测到的同名歧义或无法核验的会话，失败时保留上次保存的选择。在内置 ARM64 英文配置下，已选定会话的标题若在微信侧栏同时出现两条可识别记录，Bridge 会阻止受控发送。读取仍依据标题和类型。界面未暴露的同名会话或后来复用的名称，可能无法区分。
