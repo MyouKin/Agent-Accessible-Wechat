@@ -14,6 +14,7 @@ _AVATAR_TOP = 8
 _AVATAR_SIZE = 36
 _LEFT_AVATAR_MARGIN = 20
 _RIGHT_AVATAR_MARGIN = 22
+_INCOMING_MEDIA_TOP = 28
 
 
 @dataclass(frozen=True)
@@ -92,11 +93,14 @@ def _text_mask(image: Image.Image) -> list[Image.Image]:
     ]
 
 
-def _bubble(row: Image.Image, is_self: bool, kind: str, *, allow_cutoff: bool = False) -> Box | None:
+def _bubble(
+    row: Image.Image, is_self: bool, kind: str, *,
+    allow_cutoff: bool = False, incoming_media_top: int = _INCOMING_MEDIA_TOP,
+) -> Box | None:
     width, height = row.size
     left_edge, right_edge = 62, width - 64
     media = kind in {"image", "sticker"}
-    top_edge = 5 if is_self else 28 if media else 24
+    top_edge = 5 if is_self else incoming_media_top if media else 24
     content = row.crop((left_edge, top_edge, right_edge, height - 4))
     if kind == "text":
         masks = _text_mask(content)
@@ -121,6 +125,20 @@ def _bubble(row: Image.Image, is_self: bool, kind: str, *, allow_cutoff: bool = 
             continue
         results.add((left + left_edge, top + top_edge, right + left_edge, bottom + top_edge))
     return next(iter(results)) if len(results) == 1 else None
+
+
+def _incoming_photo_crop(row: Image.Image) -> Box | None:
+    visible = _bubble(row, False, "image", allow_cutoff=True)
+    if visible is None or visible[1] != _INCOMING_MEDIA_TOP:
+        return None
+    # Verify the photo begins just above the usual nickname cutoff without
+    # including that upper strip in the crop we keep.
+    upper = _bubble(row, False, "image", incoming_media_top=_INCOMING_MEDIA_TOP - 4)
+    if upper is not None:
+        left, top, right, bottom = upper
+        if top <= _INCOMING_MEDIA_TOP and (left, _INCOMING_MEDIA_TOP, right, bottom) == visible:
+            return visible
+    return None
 
 
 def image_preview_box(row: Image.Image, layout: RowLayout) -> Box | None:
@@ -154,5 +172,7 @@ def analyze_message_row(row: Image.Image, kind: str) -> RowLayout:
     if not _has_avatar_shape(foreground, avatar):
         return RowLayout()
     bubble = _bubble(row, is_self, kind)
+    if bubble is None and not is_self and kind == "image":
+        bubble = _incoming_photo_crop(row)
     return RowLayout(is_self=is_self, avatar_box=avatar, bubble_box=bubble,
                      media_box=bubble if kind in {"image", "sticker"} else None)

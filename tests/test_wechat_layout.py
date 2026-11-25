@@ -77,10 +77,33 @@ def test_pre_click_check_requires_unchanged_exact_pixels_and_bounds(monkeypatch)
     assert not _same_visible_crop(row, box, original, window, 42)
 
 
-def test_native_click_can_use_visible_interior_of_a_photo_touching_name_cutoff():
+def test_amd64_photo_touching_nickname_cutoff_saves_verified_interior_only(monkeypatch, tmp_path):
     row = Image.new("RGB", (578, 156), "#fafafa")
     paint(row, (20, 8, 56, 44), "#84726d")
+    paint(row, (68, 12, 151, 19), "#636363")
     paint(row, (69, 26, 235, 144), "#efd0f0")
+    layout = analyze_message_row(row, "image")
+    assert layout.media_box == layout.bubble_box == (69, 28, 235, 144)
+    assert image_preview_box(row, layout) == layout.media_box
+    assert analyze_message_row(row, "sticker").media_box is None
+    bounds = (100, 50, *row.size)
+    chat = SimpleNamespace(pid=42, panel=SimpleNamespace(bounds=bounds),
+                           window=SimpleNamespace(bounds=(0, 0, 880, 640)))
+    source = AccessibilitySource("fixture", profile="wechat-4.1.13.29-amd64-en", media_dir=tmp_path)
+    monkeypatch.setattr("bridge.accessibility._capture_pixels", lambda *_: (row, bounds))
+    monkeypatch.setattr(source, "_verify_chat", lambda _chat: None)
+    message = Message(chat="fixture", type="image", text="Image")
+    saved, = source._with_media([(SimpleNamespace(bounds=bounds), message, None)], chat)
+    assert saved.metadata["capture_quality"] == "wechat_bubble_estimate"
+    with Image.open(tmp_path / saved.media_path) as crop:
+        assert crop.format == "PNG" and crop.size == (166, 116)
+        assert crop.tobytes() == row.crop(layout.media_box).tobytes()
+
+
+def test_photo_touching_earlier_search_edge_is_not_saved():
+    row = Image.new("RGB", (578, 156), "#fafafa")
+    paint(row, (20, 8, 56, 44), "#84726d")
+    paint(row, (69, 23, 235, 144), "#efd0f0")
     layout = analyze_message_row(row, "image")
     assert layout.media_box is None
     assert image_preview_box(row, layout) == (69, 28, 235, 144)
@@ -143,11 +166,12 @@ def test_layout_rejects_no_avatar_both_avatars_and_unknown_background():
 
 
 def test_ambiguous_media_keeps_avatar_without_cropping_a_message():
-    row = Image.new("RGB", (578, 156), "#fafafa")
-    paint(row, (20, 8, 56, 44), "#84726d")
-    paint(row, (73, 31, 144, 110), "#4f6d94")
-    paint(row, (230, 31, 344, 110), "#9a8446")
-    assert analyze_message_row(row, "image") == RowLayout(False, (20, 8, 56, 44))
+    for top in (26, 31):
+        row = Image.new("RGB", (578, 156), "#fafafa")
+        paint(row, (20, 8, 56, 44), "#84726d")
+        paint(row, (73, top, 144, 110), "#4f6d94")
+        paint(row, (230, top, 344, 110), "#9a8446")
+        assert analyze_message_row(row, "image") == RowLayout(False, (20, 8, 56, 44))
 
 
 def test_quote_abstains_when_two_filled_rectangles_share_the_avatar_lane():
