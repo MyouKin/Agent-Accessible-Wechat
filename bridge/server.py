@@ -8,6 +8,8 @@ from hmac import compare_digest
 from mimetypes import guess_type
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
+from unicodedata import category
+from uuid import uuid4
 
 import httpx
 import uvicorn
@@ -33,6 +35,8 @@ ToolLimit = Annotated[int, Field(ge=1, le=200)]
 ToolCursor = Annotated[int, Field(ge=0)]
 ToolWaitSeconds = Annotated[float, Field(ge=0, le=30)]
 ToolSearch = Annotated[str, Field(min_length=1, max_length=300)]
+SessionKey = Annotated[str, Field(pattern=r"^session-[0-9a-f]{24}$")]
+SessionRevision = Annotated[str, Field(min_length=1, max_length=128)]
 
 
 class DraftBody(BaseModel):
@@ -41,6 +45,7 @@ class DraftBody(BaseModel):
     text: str = Field(min_length=1, max_length=8000)
     chat: str | None = Field(default=None, max_length=256)
     session_key: str | None = Field(default=None, max_length=64)
+    session_revision: SessionRevision | None = None
     request_id: str | None = Field(default=None, min_length=1, max_length=128)
     auto_send: bool = False
     quote_message_id: int | None = Field(default=None, gt=0, le=2**63 - 1, strict=True)
@@ -74,7 +79,28 @@ class AgentWechatToolBody(BaseModel):
 class SelectSessionBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    key: str = Field(pattern=r"^session-[0-9a-f]{24}$")
+    key: SessionKey
+
+
+class SessionSelection(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    revision: SessionRevision
+    mention_nickname: str | None = Field(min_length=1, max_length=256)
+
+    @field_validator("mention_nickname")
+    @classmethod
+    def validate_mention_nickname(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        nickname = value.strip()
+        if not nickname or any(category(char) in {"Cc", "Cs", "Zl", "Zp"} for char in value):
+            raise ValueError("Use a nonblank, single-line group nickname")
+        return nickname
+
+
+class SessionMentionBody(SessionSelection):
+    session_key: SessionKey
 
 
 class Bridge:
@@ -85,6 +111,7 @@ class Bridge:
         self.source = source
         self.sender = sender
         self.active_session: Session | None = None
+        self.session_selection: SessionSelection | None = None
         self.restore_target: Session | None = None
         self.restore_failed = False
         self.activation_lock = asyncio.Lock()
@@ -100,6 +127,8 @@ class Bridge:
             "source": source,
             "sync": self.store.sync_status(),
             "active_session": self.active_session.summary(active=True) if self.active_session else None,
+            "session_selection": self.session_selection.model_dump()
+            if self.active_session and self.session_selection else None,
             "session_restore": ("failed" if self.restore_failed else "waiting") if self.restore_target else None,
         }
 
@@ -108,13 +137,34 @@ class Bridge:
         if session_key is not None and session_key != expected:
             raise HTTPException(409, "The active WeChat session changed")
 
-    def check_chat(self, chat: str | None = None, session_key: str | None = None) -> None:
+    def check_chat(self, chat: str | None = None, session_key: str | None = None,
+                   session_revision: str | None = None) -> None:
         self.check_key(session_key)
         if self.synchronizer.paused or not self.store.chat or (chat is not None and chat != self.store.chat):
             raise HTTPException(409, "The request must target the active WeChat session")
+        if session_revision is not None and (
+            self.session_selection is None or self.session_selection.revision != session_revision
+        ):
+            raise HTTPException(409, "The active WeChat session selection changed")
+
+    def save_session_selection(self, target: Session, selection: SessionSelection) -> None:
+        self.store.select_session(
+            target.model_dump(), revision=selection.revision, mention_nickname=selection.mention_nickname,
+        )
+
+    async def set_session_mention(self, payload: SessionMentionBody) -> SessionSelection:
+        async with self.activation_lock:
+            self.check_chat(session_key=payload.session_key, session_revision=payload.revision)
+            target = self.active_session
+            if target is None or target.kind != "group":
+                raise HTTPException(409, "The active WeChat session must be a verified group")
+            selection = SessionSelection(revision=payload.revision, mention_nickname=payload.mention_nickname)
+            self.save_session_selection(target, selection)
+            self.session_selection = selection
+            return selection
 
     async def activate_session(self, target: Session, client: httpx.AsyncClient | None, token: str,
-                               *, restoring: bool = False) -> Session | None:
+                               *, restoring: bool = False) -> tuple[Session, SessionSelection] | None:
         async with self.activation_lock:
             if restoring and self.restore_target != target:
                 return None
@@ -123,6 +173,9 @@ class Bridge:
                 sync.paused = True
             try:
                 opened = await open_session(client, token, target)
+                selection = self.session_selection if restoring else None
+                if selection is None:
+                    selection = SessionSelection(revision=uuid4().hex, mention_nickname=None)
                 previous_chat = self.store.chat
                 previous_kind = self.active_session.kind if self.active_session else None
                 async with sync.operation_lock:
@@ -131,7 +184,7 @@ class Bridge:
                         snapshot = await self.source.prepare_target()
                         if not snapshot.ready or not snapshot.at_tail or snapshot.chat != opened.name:
                             raise HTTPException(409, "Could not verify the selected session at the latest message")
-                        self.store.select_session(opened.model_dump())
+                        self.save_session_selection(opened, selection)
                     except BaseException:
                         await self.source.set_target(previous_chat, previous_kind)
                         raise
@@ -139,9 +192,10 @@ class Bridge:
                     self.store.bind_target(opened.name, opened.partition)
                     sync.target_changed()
                     self.active_session = opened
+                    self.session_selection = selection
                     self.restore_target = None
                     self.restore_failed = False
-                return opened
+                return opened, selection
             finally:
                 sync.paused = self.restore_target is not None
 
@@ -188,7 +242,7 @@ class Bridge:
         return {"content": [{"type": "text", "text": result}]}
 
     async def draft(self, payload: DraftBody, *, origin: str) -> dict:
-        self.check_chat(payload.chat, payload.session_key)
+        self.check_chat(payload.chat, payload.session_key, payload.session_revision)
         if payload.auto_send and (
             self.settings.send_mode != "auto" or origin != "http" or not payload.request_id
         ):
@@ -201,12 +255,13 @@ class Bridge:
         except ValueError as error:
             raise HTTPException(409, str(error)) from error
         if payload.auto_send:
-            return await self.confirm(row["id"], payload.session_key)
+            return await self.confirm(row["id"], payload.session_key, session_revision=payload.session_revision)
         return row
 
-    async def confirm(self, draft_id: int, session_key: str | None = None) -> dict:
+    async def confirm(self, draft_id: int, session_key: str | None = None,
+                      *, session_revision: str | None = None) -> dict:
         async with self.synchronizer.operation_lock:
-            self.check_chat(session_key=session_key)
+            self.check_chat(session_key=session_key, session_revision=session_revision)
             return await self._confirm(draft_id)
 
     async def _confirm(self, draft_id: int) -> dict:
@@ -413,10 +468,14 @@ def create_app(settings: Settings, token: str, mcp_token: str = "", *, source=No
             bridge.store = store
             stack.callback(store.close)
             bridge.active_session = None
+            bridge.session_selection = None
             bridge.restore_target = None
             bridge.restore_failed = False
             if (selected := store.selected_session()) is not None:
-                bridge.restore_target = Session.model_validate(selected)
+                target, revision, nickname = selected
+                bridge.restore_target = Session.model_validate(target)
+                if revision is not None:
+                    bridge.session_selection = SessionSelection(revision=revision, mention_nickname=nickname)
                 store.bind_target("")
             synchronizer = Synchronizer(source, store, settings.poll_interval)
             synchronizer.paused = bridge.restore_target is not None
@@ -513,8 +572,13 @@ def create_app(settings: Settings, token: str, mcp_token: str = "", *, source=No
             raise HTTPException(404, "The selected session is no longer in the WeChat list")
         if len(matches) != 1:
             raise HTTPException(409, "The selected session has more than one match")
-        active = await bridge.activate_session(matches[0], wechat_tools_client, wechat_tools_token)
-        return {"active": active.summary(active=True)}
+        active, selection = await bridge.activate_session(matches[0], wechat_tools_client, wechat_tools_token)
+        return {"active": active.summary(active=True), "session_selection": selection.model_dump()}
+
+    @app.put("/sessions/active/mention")
+    async def set_session_mention(payload: SessionMentionBody):
+        selection = await bridge.set_session_mention(payload)
+        return {"session_selection": selection.model_dump()}
 
     @app.get("/messages")
     async def messages(limit: Limit = 30, for_model: bool = False, session_key: str | None = None):

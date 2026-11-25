@@ -381,6 +381,7 @@ class AgentState:
 
     def bind_chat(
         self, chat: str, latest: int, *, session_key: str | None = None, session_kind: str | None = None,
+        session_revision: str | None = None,
     ) -> None:
         with self.db:
             cursor = self.get("cursor")
@@ -388,13 +389,17 @@ class AgentState:
             same_binding = (saved_key, saved_kind) == (session_key, session_kind) or (
                 saved_key in (None, LEGACY_SESSION_KEY) and (session_key in (None, LEGACY_SESSION_KEY) or session_kind == "group")
             )
-            if self.get("chat") != chat or not same_binding or cursor is None or cursor > latest:
+            if (
+                self.get("chat") != chat or not same_binding or cursor is None or cursor > latest
+                or self.get("session_revision") != session_revision
+            ):
                 self.db.execute("DELETE FROM pending_jobs")
                 self.db.execute("DELETE FROM agent_state")
                 self.set("chat", chat)
                 self.set("cursor", latest)
             self.set("session_key", session_key)
             self.set("session_kind", session_kind)
+            self.set("session_revision", session_revision)
 
     def collect(
         self, messages: list[dict], target_chat: str, settings: Settings, now: float, *, session_kind: str | None = None,
@@ -558,6 +563,29 @@ def status_session(status: dict) -> tuple[str | None, str | None]:
     return active["key"], active["kind"]
 
 
+@dataclass(frozen=True)
+class SessionSelection:
+    revision: str
+    mention_nickname: str | None
+
+
+def session_selection(status: dict) -> SessionSelection | None:
+    if not isinstance(status, dict):
+        raise ValueError("Invalid Bridge session selection")
+    selection = status.get("session_selection")
+    if selection is None:
+        return None
+    if not isinstance(selection, dict):
+        raise ValueError("Invalid Bridge session selection")
+    revision = selection.get("revision")
+    nickname = selection.get("mention_nickname")
+    if not isinstance(revision, str) or not revision.strip() or (
+        nickname is not None and (not isinstance(nickname, str) or not nickname.strip())
+    ):
+        raise ValueError("Invalid Bridge session selection")
+    return SessionSelection(revision, nickname)
+
+
 def session_parameters(session_key: str | None) -> dict[str, str]:
     return {"session_key": session_key} if session_key is not None else {}
 
@@ -600,7 +628,20 @@ class BridgeClient:
         # The verified key can differ when an initially unknown kind is established by opening WeChat.
         if active.get("active") is not True or active["kind"] == "unknown":
             raise ValueError("Bridge did not confirm an active session")
-        return active
+        return {**active, "session_selection": session_selection(result)}
+
+    async def set_group_mention(self, nickname: str | None) -> None:
+        status = await self.get("status")
+        key, kind = status_session(status)
+        selection = session_selection(status)
+        if kind != "group" or key is None or selection is None:
+            raise ValueError("Select a group with a Bridge that supports per-selection nicknames first.")
+        response = await self.http.put("sessions/active/mention", json={
+            "session_key": key, "revision": selection.revision, "mention_nickname": nickname,
+        })
+        response.raise_for_status()
+        if session_selection(response.json()) != SessionSelection(selection.revision, nickname):
+            raise ValueError("Bridge did not confirm the group nickname")
 
     async def list_tools(
         self, *, scope: str | None = None, chat: str | None = None, session_key: str | None = None,
@@ -1360,6 +1401,8 @@ class Companion:
         self.chat: str | None = None
         self.session_key: str | None = None
         self.session_kind: str | None = None
+        self.selection: SessionSelection | None = None
+        self.mentions = settings.mentions
         self.ready = False
         self.native_quote_supported = True
         self.scope = 0
@@ -1376,7 +1419,10 @@ class Companion:
         status = await self.bridge.get("status")
         self.ready = False
         binding = status_session(status)
-        self.ready = binding == (self.session_key, self.session_kind) and self.status_is_ready(status, chat)
+        self.ready = (
+            binding == (self.session_key, self.session_kind) and self.status_is_ready(status, chat)
+            and self.selection == session_selection(status)
+        )
         if self.ready:
             self.native_quote_supported = (status.get("source") or {}).get("native_quote_supported", True) is True
         return self.ready
@@ -1386,6 +1432,7 @@ class Companion:
         chat = status.get("chat")
         try:
             session_key, session_kind = status_session(status)
+            selection = session_selection(status)
         except ValueError:
             self.ready = False
             raise
@@ -1393,11 +1440,17 @@ class Companion:
             if self.chat is not None:
                 self.scope += 1
             self.chat, self.session_key, self.session_kind = None, None, None
+            self.selection = None
             self.ready = False
             return
         available = self.status_is_ready(status, chat)
         params = session_parameters(session_key)
-        if (self.chat, self.session_key, self.session_kind) != (chat, session_key, session_kind):
+        revision = selection.revision if selection else None
+        previous_revision = self.selection.revision if self.selection else None
+        binding_changed = (self.chat, self.session_key, self.session_kind, previous_revision) != (
+            chat, session_key, session_kind, revision,
+        )
+        if binding_changed:
             self.chat, self.session_key, self.session_kind = None, None, None
             self.ready = False
             self.scope += 1
@@ -1405,13 +1458,26 @@ class Companion:
                 return
             rows = (await self.bridge.get("messages", limit=1, **params))["messages"]
             latest = max((row["id"] for row in rows if row.get("chat") == chat), default=0)
-            self.state.bind_chat(chat, latest, session_key=session_key, session_kind=session_kind)
+            self.state.bind_chat(
+                chat, latest, session_key=session_key, session_kind=session_kind, session_revision=revision,
+            )
             self.chat, self.session_key, self.session_kind = chat, session_key, session_kind
             LOG.info(
                 "Bridge ready; polling at %.0fs from message %s (%s)",
                 self.settings.poll_seconds, self.state.get("cursor"),
                 "auto-send" if self.settings.auto_send else "drafts",
             )
+        if selection != self.selection and not binding_changed:
+            self.scope += 1
+        if selection is not None:
+            nickname = selection.mention_nickname
+            if not nickname and session_kind == "group" and (binding_changed or self.selection != selection):
+                LOG.warning("Group nickname is empty. Set it with --set-mention NICKNAME to enable @ triggers.")
+            self.mentions = (nickname,) if session_kind == "group" and nickname else ()
+        else:
+            legacy_mentions = session_key in (None, LEGACY_SESSION_KEY) or "session_selection" not in status
+            self.mentions = self.settings.mentions if legacy_mentions else ()
+        self.selection = selection
         self.ready = available
         if not available:
             return
@@ -1419,7 +1485,7 @@ class Companion:
         rows = (await self.bridge.get("messages/new", after_id=cursor, limit=100, **params))["messages"]
         if rows:
             await self.resolve_early_delivery(chat, rows, session_key=session_key)
-            self.state.collect(rows, chat, self.settings, now, session_kind=session_kind)
+            self.state.collect(rows, chat, replace(self.settings, mentions=self.mentions), now, session_kind=session_kind)
 
     async def resolve_early_delivery(
         self, chat: str, rows: list[dict], *, session_key: str | None = None,
@@ -1464,7 +1530,7 @@ class Companion:
             return None
         if self.session_kind == "private" or job.reason == "private-message":
             return message if self.session_kind == "private" and job.reason == "private-message" and is_private_peer(message) else None
-        if job.reason in {"mention", "unattributed-mention"} and not was_mentioned(main_text(message), self.settings.mentions):
+        if job.reason in {"mention", "unattributed-mention"} and not was_mentioned(main_text(message), self.mentions):
             return None
         if job.reason == "agent-quote" and not quotes_agent(message):
             return None
@@ -1660,7 +1726,7 @@ class Companion:
         ):
             return .5
         if decision.reply and (
-            not self.settings.allow_unattributed_mentions or not contains_mention(decision.reply, self.settings.mentions)
+            not self.settings.allow_unattributed_mentions or not contains_mention(decision.reply, self.mentions)
         ):
             if decision.quote_message_id is not None and not self.native_quote_supported:
                 decision = replace(decision, quote_message_id=None)
@@ -1685,6 +1751,8 @@ class Companion:
                 "text": decision.reply, "chat": job.message["chat"], "author_kind": "llm",
                 "request_id": job.request_id("draft"), "auto_send": mode, **params,
             }
+            if self.selection is not None:
+                draft["session_revision"] = self.selection.revision
             if decision.quote_message_id is not None:
                 draft["quote_message_id"] = decision.quote_message_id
             try:
@@ -1765,20 +1833,34 @@ def print_session_table(result: dict) -> None:
         print("Session discovery is incomplete. Some conversations may be absent.")
 
 
-async def manage_sessions(settings: Settings, key: str | None = None) -> None:
+async def manage_sessions(settings: Settings, key: str | None = None, *, mention: str | None = None) -> None:
     headers = {"Authorization": f"Bearer {settings.bridge_token}"}
     try:
         async with asyncio.timeout(85), httpx.AsyncClient(
             base_url=settings.bridge_url + "/", headers=headers, timeout=85, trust_env=False,
         ) as http:
             bridge = BridgeClient(http)
-            if key is None:
+            if mention is not None:
+                nickname = mention.strip() or None
+                await bridge.set_group_mention(nickname)
+                print("Group nickname saved. @ triggers are enabled." if nickname else
+                      "Group nickname cleared. Set it with --set-mention NICKNAME to enable @ triggers.")
+            elif key is None:
                 print_session_table(await bridge.list_sessions())
             else:
                 active = await bridge.activate_session(key)
                 print(f"Active session: {terminal_text(active['name'])} ({terminal_text(active['key'])})")
+                if active["kind"] == "group" and active["session_selection"] is not None:
+                    print("Group nickname cleared. Set it with --set-mention NICKNAME to enable @ triggers.")
     except httpx.HTTPStatusError as error:
         status = error.response.status_code
+        if mention is not None and status in {404, 409, 422}:
+            messages = {
+                404: "Group nickname configuration is unavailable on this Bridge.",
+                409: "The active group changed. Verify the selected group and retry.",
+                422: "Enter a valid group nickname, or pass an empty string to clear it.",
+            }
+            raise ValueError(messages[status]) from error
         if status == 404:
             message = (
                 "Session discovery is unavailable on this Bridge."
@@ -1851,6 +1933,7 @@ def main() -> None:
     commands.add_argument("--demo", action="store_true", help="Use only synthetic conversation data and call only the model")
     commands.add_argument("--list-sessions", action="store_true", help="List WeChat conversations discovered by the Bridge")
     commands.add_argument("--set-session", metavar="KEY", help="Activate a conversation using its local session key")
+    commands.add_argument("--set-mention", metavar="NICKNAME", help="Set the current group's nickname used for @ triggers")
     parser.add_argument("--run", action="store_true", help="Start the Agent after activating a conversation")
     args = parser.parse_args()
     if args.run and args.set_session is None:
@@ -1858,10 +1941,10 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
-        session_only = args.list_sessions or (args.set_session is not None and not args.run)
+        session_only = args.list_sessions or args.set_mention is not None or (args.set_session is not None and not args.run)
         settings = Settings.from_env(args.demo, bridge_only=session_only)
         if session_only:
-            asyncio.run(manage_sessions(settings, args.set_session))
+            asyncio.run(manage_sessions(settings, args.set_session, mention=args.set_mention))
         else:
             asyncio.run(run(settings, args.demo, session_key=args.set_session))
     except KeyboardInterrupt:

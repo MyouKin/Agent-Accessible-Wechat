@@ -196,8 +196,9 @@ curl --fail --silent --get -H "Authorization: Bearer $BRIDGE_TOKEN" \
 
 | HTTP 端点 | 用途 |
 | --- | --- |
-| `GET /health` / `GET /status` | 进程探测，以及活跃会话、恢复状态、窗口、源版本、尾部和同步状态。 |
+| `GET /health` / `GET /status` | 进程探测，以及活跃会话、恢复状态、当前选择的修订号和群昵称、窗口、源版本、尾部和同步状态。 |
 | `GET /sessions` / `PUT /sessions/active` | 列出可见会话及 `active`、`complete`。传 `{"key":"…"}` 打开、校验并保存一个活跃会话。 |
+| `PUT /sessions/active/mention` | 为当前群聊保存点名昵称，传入 `session_key`、`revision` 和 `mention_nickname`。修订号来自 `/status` 的 `session_selection`。传 `null` 清空。 |
 | `GET /messages` / `GET /messages/new?after_id=ID` | 近期记录和按 ID 分页的增量。 |
 | `GET /messages/wait?after_id=ID&timeout=15` | 等待已提交的新消息，超时返回 `{"messages":[]}`。最长 30 秒。 |
 | `GET /messages/{message_id}` | 按当前会话的消息 ID 查看单条记录。 |
@@ -264,7 +265,7 @@ if [ ! -e .env.agent ]; then
 fi
 ```
 
-在 `.env.agent` 按下节配置模型。选定群聊后，在 `AGENT_MENTIONS` 填写微信在该群的 `@` 文本中显示的本人昵称，填写时省略 `@`。多个实际显示名以逗号分隔。留空时，Agent 不使用文本点名触发。切换群聊后，按新群的实际显示名调整配置并重启 Agent。
+在 `.env.agent` 按下节配置模型。群聊的点名昵称在[选择会话后](#首次选择会话)通过 `--set-mention` 填写。
 
 项目自带的 `persona.md` 默认留空。可在里面填入自定义 system prompt，或将其他 UTF-8 文件的路径写入 `AGENT_PERSONA_PATH`。留空时，模型只接收 Agent 内置的会话和草稿规则。配置修改后重启 Agent。模型密钥保存在仅当前用户可读的环境文件中。 [uv 环境文件](https://docs.astral.sh/uv/configuration/files/#environment-variable-files)
 
@@ -337,6 +338,16 @@ uv run --locked --env-file .env --env-file .env.agent python -m agent --set-sess
 ```
 
 Bridge 打开唯一同名的搜索结果，核对标题、类型和消息尾部，再把选择持久化到 `bridge-data` 卷中的 SQLite。对类型已确认的会话，若完整标题搜索同时返回一条匹配类型的结果和一条同名的未知类型结果，Bridge 会用较短的查询词重试，仍要求完整标题和类型唯一匹配。会话类型从 `unknown` 确认为群聊或私聊后，返回的本地选择键可能变化。后续 HTTP 请求使用 `/status` 中的 `active_session.key`。原生 ID 缺失时，本地会话键基于标题与类型。Bridge 会拒绝检测到的同名歧义或无法核验的会话，失败时保留上次保存的选择。在内置英文配置下，已选定会话的标题若在微信侧栏同时出现两条可识别记录，Bridge 会阻止受控发送。读取仍依据标题和类型。界面未暴露的同名会话或后来复用的名称，可能无法区分。
+
+每次通过 `--set-session` 成功选择群聊，Bridge 都会清空点名昵称，重新选择同一个群也会清空。命令会提示填写微信在该群 `@` 文本中实际显示的本人昵称，填写时省略 `@`。
+
+```bash
+printf '输入本群实际显示的昵称 '
+IFS= read -r group_nickname
+uv run --locked --env-file .env --env-file .env.agent python -m agent --set-mention "$group_nickname"
+```
+
+Agent 在下一次轮询时使用新设置。留空时关闭文本 `@` 触发，其他触发按各自设置运行。Bridge 重启并恢复已选会话时会恢复本次设置。旧版 Bridge 和 YAML 中的旧版固定群配置可继续用 `.env.agent` 的 `AGENT_MENTIONS`。
 
 首次选择时也可直接启动 Agent。准备好 `.env.agent` 后运行。
 

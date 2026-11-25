@@ -1,3 +1,5 @@
+import sqlite3
+from contextlib import closing
 from time import monotonic, sleep
 
 import pytest
@@ -133,14 +135,99 @@ def test_duplicate_or_unverified_selection_does_not_replace_saved_target(tmp_pat
     client, _ = client_for(tmp_path, desktop)
     with client:
         group, peer = client.get("/sessions", headers=AUTH).json()["sessions"]
-        active = client.put("/sessions/active", json={"key": group["key"]}, headers=AUTH).json()["active"]
+        activated = client.put("/sessions/active", json={"key": group["key"]}, headers=AUTH).json()
         desktop["catalog"].append(desktop["catalog"][1])
         assert client.put("/sessions/active", json={"key": peer["key"]}, headers=AUTH).status_code == 409
         assert desktop["calls"] == ["项目群"]
         desktop["catalog"].pop()
         desktop["fail_prepare"] = True
         assert client.put("/sessions/active", json={"key": peer["key"]}, headers=AUTH).status_code == 409
-        assert client.get("/status", headers=AUTH).json()["active_session"] == active
+        status = client.get("/status", headers=AUTH).json()
+        assert status["active_session"] == activated["active"]
+        assert status["session_selection"] == activated["session_selection"]
+
+
+def test_group_mention_is_reset_on_reselection_and_rejects_stale_updates(tmp_path, desktop):
+    client, sender = client_for(tmp_path, desktop)
+    mention_route = "/sessions/active/mention"
+    with client:
+        assert client.get("/status", headers=AUTH).json()["session_selection"] is None
+        group, peer = client.get("/sessions", headers=AUTH).json()["sessions"]
+        activated = client.put("/sessions/active", json={"key": group["key"]}, headers=AUTH).json()
+        session_key = activated["active"]["key"]
+        previous = activated["session_selection"]
+        assert previous["mention_nickname"] is None
+        payload = {"session_key": session_key, "revision": previous["revision"], "mention_nickname": "群测试昵称"}
+        assert client.put(mention_route, json=payload).status_code == 401
+        for invalid in (" ", "多行\n昵称", "控制\u2028字符", 13):
+            assert client.put(mention_route, json={**payload, "mention_nickname": invalid},
+                              headers=AUTH).status_code == 422
+        expected = {"revision": previous["revision"], "mention_nickname": "群测试昵称"}
+        assert client.put(mention_route, json=payload, headers=AUTH).json() == {"session_selection": expected}
+        assert client.get("/status", headers=AUTH).json()["session_selection"] == expected
+
+        reselection = client.put("/sessions/active", json={"key": session_key}, headers=AUTH).json()
+        assert reselection["active"] == activated["active"]
+        current = reselection["session_selection"]
+        assert current["revision"] != previous["revision"] and current["mention_nickname"] is None
+        assert client.put(mention_route, json=payload, headers=AUTH).status_code == 409
+        draft = {"text": "合成草稿", "session_key": session_key}
+        stale = client.post("/drafts", json={**draft, "session_revision": previous["revision"]}, headers=AUTH)
+        assert stale.status_code == 409
+        assert client.get("/drafts", headers=AUTH).json()["drafts"] == []
+        created = client.post("/drafts", json={**draft, "session_revision": current["revision"]}, headers=AUTH)
+        assert created.status_code == 200 and created.json()["status"] == "pending"
+
+        updated = {**payload, "revision": current["revision"]}
+        assert client.put(mention_route, json=updated, headers=AUTH).status_code == 200
+        assert client.put(mention_route, json={**updated, "mention_nickname": None}, headers=AUTH).json() == {
+            "session_selection": current,
+        }
+        private = client.put("/sessions/active", json={"key": peer["key"]}, headers=AUTH).json()
+        assert client.put(mention_route, headers=AUTH, json={
+            "session_key": private["active"]["key"],
+            "revision": private["session_selection"]["revision"],
+            "mention_nickname": "群测试昵称",
+        }).status_code == 409
+        assert not sender.calls
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_group_mention_restore_preserves_revision_and_upgrades_legacy_selection(tmp_path, desktop, legacy):
+    selected = Session(name="项目群", kind="group")
+    mention = None if legacy else "持续群昵称"
+    previous = None
+    if legacy:
+        with closing(sqlite3.connect(tmp_path / "messages.db")) as db, db:
+            db.execute("CREATE TABLE active_session (singleton INTEGER PRIMARY KEY, selection TEXT NOT NULL)")
+            db.execute("INSERT INTO active_session VALUES (1, ?)", (selected.model_dump_json(),))
+    else:
+        client, _ = client_for(tmp_path, desktop)
+        with client:
+            group = client.get("/sessions", headers=AUTH).json()["sessions"][0]
+            activated = client.put("/sessions/active", json={"key": group["key"]}, headers=AUTH).json()
+            revision = activated["session_selection"]["revision"]
+            previous = client.put("/sessions/active/mention", headers=AUTH, json={
+                "session_key": selected.key, "revision": revision, "mention_nickname": mention,
+            }).json()["session_selection"]
+
+    for _ in range(2):
+        desktop["open"] = None
+        client, _ = client_for(tmp_path, desktop)
+        with client:
+            deadline = monotonic() + 3
+            while monotonic() < deadline:
+                restored = client.get("/status", headers=AUTH).json()
+                if restored["source"]["ready"]:
+                    break
+                sleep(.02)
+            assert restored["source"]["ready"] is True and restored["session_restore"] is None
+            assert restored["active_session"] == selected.summary(active=True)
+            current = restored["session_selection"]
+            assert current["revision"] and current["mention_nickname"] == mention
+            if previous is not None:
+                assert current == previous
+            previous = current
 
 
 def test_saved_selection_waits_for_login_without_changing_partitions(tmp_path, desktop):
@@ -154,6 +241,7 @@ def test_saved_selection_waits_for_login_without_changing_partitions(tmp_path, d
         status = client.get("/status", headers=AUTH).json()
         assert status["session_restore"] == "waiting"
         assert status["active_session"] is None and status["source"]["ready"] is False
+        assert status["session_selection"] is None
         assert client.get("/sessions", headers=AUTH).status_code == 409
         assert client.post("/drafts", headers=AUTH, json={"text": "not during login"}).status_code == 409
         assert desktop["calls"] == sender.calls == []

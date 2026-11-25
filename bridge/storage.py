@@ -55,7 +55,9 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE INDEX IF NOT EXISTS memories_chat_id ON memories(chat, id);
 CREATE TABLE IF NOT EXISTS active_session (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    selection TEXT NOT NULL
+    selection TEXT NOT NULL,
+    revision TEXT,
+    mention_nickname TEXT
 );
 """
 
@@ -79,6 +81,10 @@ class Store:
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE drafts ADD COLUMN {name} {declaration}")
+            session_columns = {column["name"] for column in db.execute("PRAGMA table_info(active_session)")}
+            for name in ("revision", "mention_nickname"):
+                if name not in session_columns:
+                    db.execute(f"ALTER TABLE active_session ADD COLUMN {name} TEXT")
             db.execute(
                 """UPDATE drafts SET status='uncertain', detail=?, updated_at=?
                    WHERE status='sending'""",
@@ -89,16 +95,22 @@ class Store:
         self.chat = chat
         self.partition = chat if partition is None else partition
 
-    def selected_session(self) -> dict | None:
-        row = self.connection.execute("SELECT selection FROM active_session WHERE singleton=1").fetchone()
-        return json.loads(row["selection"]) if row else None
+    def selected_session(self) -> tuple[dict, str | None, str | None] | None:
+        row = self.connection.execute(
+            "SELECT selection, revision, mention_nickname FROM active_session WHERE singleton=1",
+        ).fetchone()
+        return (json.loads(row["selection"]), row["revision"], row["mention_nickname"]) if row else None
 
-    def select_session(self, selection: dict) -> None:
+    def select_session(
+        self, selection: dict, *, revision: str | None = None, mention_nickname: str | None = None,
+    ) -> None:
         with self.transaction() as db:
             db.execute(
-                """INSERT INTO active_session(singleton, selection) VALUES (1, ?)
-                   ON CONFLICT(singleton) DO UPDATE SET selection=excluded.selection""",
-                (json.dumps(selection, ensure_ascii=False),),
+                """INSERT INTO active_session(singleton, selection, revision, mention_nickname)
+                   VALUES (1, ?, ?, ?)
+                   ON CONFLICT(singleton) DO UPDATE SET selection=excluded.selection,
+                   revision=excluded.revision, mention_nickname=excluded.mention_nickname""",
+                (json.dumps(selection, ensure_ascii=False), revision, mention_nickname),
             )
 
     def close(self) -> None:

@@ -350,6 +350,57 @@ class CompanionTests(unittest.TestCase):
                 self.assertIn(expected, errors.getvalue())
                 self.assertNotIn("UNFORWARDED_BRIDGE_DETAIL", errors.getvalue())
 
+    def test_group_nickname_cli_pins_the_current_selection_and_can_clear_it(self):
+        active = {"key": "group-key", "kind": "group", "name": "合成测试群", "active": True}
+        selection = {"revision": "selection-2", "mention_nickname": None}
+        calls = []
+        real_client = httpx.AsyncClient
+
+        def handler(request):
+            self.assertEqual(request.url.host, "bridge.test")
+            self.assertEqual(request.headers["Authorization"], "Bearer synthetic-bridge-token")
+            body = json.loads(request.content) if request.content else None
+            method, path = request.method, request.url.path
+            calls.append((method, path, body))
+            if (method, path) == ("PUT", "/sessions/active"):
+                return httpx.Response(200, json={"active": active, "session_selection": selection})
+            if (method, path) == ("GET", "/status"):
+                return httpx.Response(200, json={
+                    "chat": active["name"], "active_session": active, "session_selection": selection,
+                })
+            self.assertEqual((method, path), ("PUT", "/sessions/active/mention"))
+            selection["mention_nickname"] = body["mention_nickname"]
+            return httpx.Response(200, json={"session_selection": selection})
+
+        def mock_client(**kwargs):
+            self.assertIs(kwargs["trust_env"], False)
+            return real_client(**kwargs, transport=httpx.MockTransport(handler))
+
+        env = {"BRIDGE_TOKEN": "synthetic-bridge-token", "AGENT_BRIDGE_URL": "http://bridge.test"}
+        output = StringIO()
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch("agent.httpx.AsyncClient", side_effect=mock_client),
+            redirect_stdout(output),
+        ):
+            for arguments in (
+                ["--set-session", "group-key"], ["--set-mention", "  群聊专用昵称  "], ["--set-mention", ""],
+            ):
+                with patch("sys.argv", ["agent", *arguments]):
+                    main()
+
+        scope = {"session_key": "group-key", "revision": "selection-2"}
+        self.assertEqual(calls, [
+            ("PUT", "/sessions/active", {"key": "group-key"}),
+            ("GET", "/status", None),
+            ("PUT", "/sessions/active/mention", scope | {"mention_nickname": "群聊专用昵称"}),
+            ("GET", "/status", None),
+            ("PUT", "/sessions/active/mention", scope | {"mention_nickname": None}),
+        ])
+        self.assertEqual(output.getvalue().count("Set it with --set-mention NICKNAME"), 2)
+        self.assertIn("Group nickname saved. @ triggers are enabled.", output.getvalue())
+        self.assertNotIn("群聊专用昵称", output.getvalue())
+
     def test_set_session_run_requires_normal_agent_config_and_forwards_key(self):
         env = {"BRIDGE_TOKEN": "synthetic-bridge-token", "LLM_BASE_URL": "http://127.0.0.1:8080/v1", "LLM_MODEL": "fake"}
         with patch.dict("os.environ", env, clear=True), patch("agent.run", new_callable=AsyncMock) as run_agent:
@@ -370,6 +421,88 @@ class CompanionTests(unittest.TestCase):
             state.bind_chat("共享名称", 24, session_key="native-key", session_kind="private")
             self.assertEqual(state.get("cursor"), 24)
             self.assertEqual(state.get("session_kind"), "private")
+
+    def test_managed_group_nickname_and_same_group_reselection_scope_pending_drafts(self):
+        async def exercise(state):
+            now = time.time()
+            chat = "合成测试群"
+            active = {"key": "group-key", "kind": "group", "name": chat, "active": True}
+            selection = {"revision": "selection-1", "mention_nickname": None}
+            rows, drafts = [], []
+            model = AsyncMock()
+            model.decide.return_value = Decision("合成新回复")
+
+            def capture(id, text):
+                rows.append(message(id, now, text, author_kind="human"))
+
+            def handler(request):
+                path = request.url.path
+                if path == "/status":
+                    return httpx.Response(200, json={
+                        "chat": chat, "source": {"ready": True}, "send_mode": "manual",
+                        "active_session": active, "session_selection": selection,
+                    })
+                if (request.method, path) == ("POST", "/drafts"):
+                    drafts.append(json.loads(request.content))
+                    return httpx.Response(200, json={"id": len(drafts), "status": "pending"})
+                self.assertEqual(request.url.params["session_key"], active["key"])
+                if path == "/messages":
+                    return httpx.Response(200, json={"messages": rows[-int(request.url.params["limit"]):]})
+                if path == "/messages/new":
+                    after, limit = (int(request.url.params[key]) for key in ("after_id", "limit"))
+                    return httpx.Response(200, json={"messages": [row for row in rows if row["id"] > after][:limit]})
+                if path == "/messages/search":
+                    return httpx.Response(200, json={"messages": []})
+                self.assertEqual(path, "/memories")
+                return httpx.Response(200, json={"memories": []})
+
+            settings = Settings(mentions=("旧配置昵称",), selective=False, wechat_tools=False)
+            async with httpx.AsyncClient(base_url="http://bridge.test/", transport=httpx.MockTransport(handler)) as http:
+                companion = Companion(settings, BridgeClient(http), model, state)
+                await companion.poll_once(now)
+                capture(1, "@旧配置昵称 你好")
+                await companion.poll_once(now)
+                self.assertIsNone(state.next_job(now))
+
+                selection["mention_nickname"] = "群测试昵称"
+                capture(2, "群测试昵称 只是提到你的名字")
+                capture(3, "@旧配置昵称 已设置新昵称")
+                capture(4, "@群测试昵称\u2005这条待回复")
+                await companion.poll_once(now)
+                old_job = state.next_job(now)
+                self.assertEqual((old_job.id, old_job.reason), (4, "mention"))
+                state.prepare(old_job, Decision("重新选择前的旧回复"))
+
+                capture(5, "@群测试昵称\u2005重新选择前的新消息")
+                selection.update(revision="selection-2", mention_nickname=None)
+                await companion.respond_once(now)
+                self.assertEqual(drafts, [])
+                await companion.poll_once(now)
+                self.assertEqual(state.get("cursor"), 5)
+                self.assertEqual(state.get("session_revision"), "selection-2")
+                self.assertIsNone(state.next_job(now))
+
+                capture(6, "@群测试昵称\u2005昵称已清空")
+                capture(7, "@旧配置昵称 也不能唤醒")
+                await companion.poll_once(now)
+                self.assertIsNone(state.next_job(now))
+
+                selection["mention_nickname"] = "新群昵称"
+                capture(8, "＠新群昵称，请回复")
+                await companion.poll_once(now)
+                await companion.respond_once(now)
+
+            model.decide.assert_awaited_once()
+            job = model.decide.await_args.args[0]
+            self.assertEqual((job.id, job.reason), (8, "mention"))
+            self.assertEqual(drafts, [{
+                "text": "合成新回复", "chat": chat, "author_kind": "llm", "request_id": job.request_id("draft"),
+                "auto_send": False, "session_key": active["key"], "session_revision": "selection-2",
+            }])
+            self.assertIsNone(state.next_job(now))
+
+        with TemporaryDirectory() as directory, AgentState.open(Path(directory) / "agent.db") as state:
+            asyncio.run(exercise(state))
 
     def test_same_title_session_switch_clears_old_jobs_and_only_verified_private_peers_trigger(self):
         async def exercise(state):
