@@ -161,7 +161,7 @@ class Settings:
     reasoning_effort: str | None = None
     quote_tool: bool = False
     wechat_tools: bool = True
-    mentions: tuple[str, ...] = ("阿桥",)
+    mentions: tuple[str, ...] = ()
     selective: bool = True
     multimodal: bool = False
     auto_send: bool = False
@@ -201,7 +201,7 @@ class Settings:
             quote_tool=False if providers else flag("LLM_QUOTE_TOOL"),
             wechat_tools=flag("AGENT_WECHAT_TOOLS", True),
             mentions=tuple(
-                alias.strip() for alias in os.getenv("AGENT_MENTIONS", "阿桥").split(",")
+                alias.strip() for alias in os.getenv("AGENT_MENTIONS", "").split(",")
                 if alias.strip()
             ),
             selective=flag("AGENT_SELECTIVE_PARTICIPATION", True),
@@ -1040,7 +1040,8 @@ class ModelClient:
     ):
         self.http = http
         self.model = model
-        self.system = f"{persona.strip()}\n\n{SYSTEM_RULES}"
+        persona = persona.strip()
+        self.system = f"{persona}\n\n{SYSTEM_RULES}" if persona else SYSTEM_RULES
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
         self.quote_tool = quote_tool
@@ -1825,7 +1826,7 @@ async def run(settings: Settings, demo: bool, *, session_key: str | None = None)
         if demo:
             conversation = [
                 {"id": 1, "chat": "合成群", "sender": "测试成员甲", "text": "周六下午一起去看展吗？", "is_self": False, "type": "text"},
-                {"id": 2, "chat": "合成群", "sender": "测试成员乙", "text": "@阿桥 给我一句简短的群聊回复。", "is_self": False, "type": "text"},
+                {"id": 2, "chat": "合成群", "sender": "测试成员乙", "text": "给我一句简短的群聊回复。", "is_self": False, "type": "text"},
             ]
             demo_budget = sum(provider.timeout for provider in settings.model_providers) or 60
             job = Job(conversation[-1], "mention", time.time() + demo_budget, None)

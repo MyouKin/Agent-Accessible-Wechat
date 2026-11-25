@@ -264,7 +264,9 @@ if [ ! -e .env.agent ]; then
 fi
 ```
 
-在 `.env.agent` 按下节配置模型，再将 `AGENT_MENTIONS` 设置为账号在目标群中的真实显示昵称。多个别名以逗号分隔。项目提供的 `persona.md` 是可编辑的原始人格示例。私有人格可另存为 UTF-8 Markdown，并将 `AGENT_PERSONA_PATH` 指向该文件，重启 Agent 后生效。模型密钥保存在仅当前用户可读的环境文件中。 [uv 环境文件](https://docs.astral.sh/uv/configuration/files/#environment-variable-files)
+在 `.env.agent` 按下节配置模型。选定群聊后，在 `AGENT_MENTIONS` 填写微信在该群的 `@` 文本中显示的本人昵称，填写时省略 `@`。多个实际显示名以逗号分隔。留空时，Agent 不使用文本点名触发。切换群聊后，按新群的实际显示名调整配置并重启 Agent。
+
+项目自带的 `persona.md` 默认留空。可在里面填入自定义 system prompt，或将其他 UTF-8 文件的路径写入 `AGENT_PERSONA_PATH`。留空时，模型只接收 Agent 内置的会话和草稿规则。配置修改后重启 Agent。模型密钥保存在仅当前用户可读的环境文件中。 [uv 环境文件](https://docs.astral.sh/uv/configuration/files/#environment-variable-files)
 
 ### 模型优先级与自动回退
 
