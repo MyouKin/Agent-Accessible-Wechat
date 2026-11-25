@@ -31,6 +31,8 @@ jobs:
     name: Docker desktop (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      CI_BRIDGE_TOKEN: ci-smoke-only-bridge-token-12345
     strategy:
       fail-fast: false
       matrix:
@@ -49,7 +51,7 @@ jobs:
         run: |
           docker run --detach --name aaw-ci --network none --cap-drop ALL \
             --security-opt no-new-privileges:true --shm-size 256m \
-            -e BRIDGE_TOKEN=ci-smoke-only -e VNC_PASSWORD=smoke123 \
+            -e "BRIDGE_TOKEN=$CI_BRIDGE_TOKEN" -e VNC_PASSWORD=smoke123 \
             agent-accessible-wechat:ci
       - name: Verify the WeChat package, Bridge API, noVNC and AT-SPI
         env:
@@ -58,6 +60,7 @@ jobs:
           expected=$(docker exec aaw-ci dpkg-query -W -f='${Architecture}' wechat)
           test "$expected" = "$EXPECTED_ARCH"
           for attempt in {1..45}; do
+            test "$(docker inspect --format '{{.State.Running}}' aaw-ci)" = true
             if docker exec aaw-ci curl -fsS --max-time 2 http://127.0.0.1:8765/health >/dev/null 2>&1; then
               break
             fi
@@ -67,7 +70,7 @@ jobs:
           docker exec aaw-ci curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null
           code=$(docker exec aaw-ci curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/status)
           test "$code" = 401
-          docker exec aaw-ci curl -fsS -H 'Authorization: Bearer ci-smoke-only' \
+          docker exec aaw-ci curl -fsS -H "Authorization: Bearer $CI_BRIDGE_TOKEN" \
             http://127.0.0.1:8765/status | python3 -c 'import json,sys; assert json.load(sys.stdin)["source"]["ready"] is False'
           for attempt in {1..30}; do
             if docker exec aaw-ci sh -c '. "$XDG_RUNTIME_DIR/bridge-session.env"; python -m tools.inspect_atspi --redact --max-nodes 15 --json -' \
