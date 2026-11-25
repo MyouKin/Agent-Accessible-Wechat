@@ -53,12 +53,16 @@ CREATE TABLE IF NOT EXISTS memories (
     UNIQUE(chat, request_id)
 );
 CREATE INDEX IF NOT EXISTS memories_chat_id ON memories(chat, id);
+CREATE TABLE IF NOT EXISTS active_session (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    selection TEXT NOT NULL
+);
 """
 
 
 class Store:
     def __init__(self, data_dir: Path, chat: str):
-        self.chat = chat
+        self.bind_target(chat)
         self.data_dir = data_dir
         self.media_dir = data_dir / "media"
         self.media_dir.mkdir(parents=True, exist_ok=True)
@@ -81,6 +85,22 @@ class Store:
                 ("Bridge stopped during the send attempt", now().isoformat()),
             )
 
+    def bind_target(self, chat: str, partition: str | None = None) -> None:
+        self.chat = chat
+        self.partition = chat if partition is None else partition
+
+    def selected_session(self) -> dict | None:
+        row = self.connection.execute("SELECT selection FROM active_session WHERE singleton=1").fetchone()
+        return json.loads(row["selection"]) if row else None
+
+    def select_session(self, selection: dict) -> None:
+        with self.transaction() as db:
+            db.execute(
+                """INSERT INTO active_session(singleton, selection) VALUES (1, ?)
+                   ON CONFLICT(singleton) DO UPDATE SET selection=excluded.selection""",
+                (json.dumps(selection, ensure_ascii=False),),
+            )
+
     def close(self) -> None:
         self.connection.close()
 
@@ -92,7 +112,7 @@ class Store:
 
     def anchors(self) -> tuple[str, ...] | None:
         row = self.connection.execute(
-            "SELECT anchors FROM sync_state WHERE chat=?", (self.chat,)
+            "SELECT anchors FROM sync_state WHERE chat=?", (self.partition,)
         ).fetchone()
         if row is None or row["anchors"] is None:
             return None
@@ -163,7 +183,7 @@ class Store:
                )
                SELECT id, record FROM prior
                WHERE body=:body OR reply=:body OR instr(body, :legacy_prefix)=1""",
-            {"chat": self.chat, "before": record["id"], "body": body, "legacy_prefix": body + "\nQuote "},
+            {"chat": self.partition, "before": record["id"], "body": body, "legacy_prefix": body + "\nQuote "},
         )
         match = None
         for row in rows:
@@ -186,7 +206,7 @@ class Store:
         with self.transaction() as db:
             db.executemany(
                 "INSERT INTO messages(chat,record) VALUES (?,?)",
-                [(self.chat, json.dumps(self._message_record(message), default=lambda dt: dt.isoformat()))
+                [(self.partition, json.dumps(self._message_record(message), default=lambda dt: dt.isoformat()))
                  for message in messages],
             )
             db.execute(
@@ -194,12 +214,12 @@ class Store:
                    ON CONFLICT(chat) DO UPDATE SET
                        anchors=coalesce(excluded.anchors,sync_state.anchors),
                        state=excluded.state, updated_at=excluded.updated_at""",
-                (self.chat, None if anchors is None else json.dumps(anchors), state, stamp),
+                (self.partition, None if anchors is None else json.dumps(anchors), state, stamp),
             )
             if gap:
                 db.execute(
                     "INSERT INTO sync_gaps(chat,reason,observed_at) VALUES (?,?,?)",
-                    (self.chat, gap, stamp),
+                    (self.partition, gap, stamp),
                 )
             if finished_draft:
                 draft_id, detail = finished_draft
@@ -207,28 +227,35 @@ class Store:
                     raise ValueError("The confirmed draft was no longer claimed")
             db.executemany(
                 "UPDATE drafts SET submission_anchors=NULL WHERE chat=? AND id=? AND status='uncertain'",
-                [(self.chat, draft_id) for draft_id in resolved_attempts],
+                [(self.partition, draft_id) for draft_id in resolved_attempts],
             )
 
     def sync_status(self) -> dict:
         row = self.connection.execute(
-            "SELECT state, updated_at FROM sync_state WHERE chat=?", (self.chat,)
+            "SELECT state, updated_at FROM sync_state WHERE chat=?", (self.partition,)
         ).fetchone()
         last_gap = self.connection.execute(
             "SELECT id,reason,observed_at FROM sync_gaps WHERE chat=? ORDER BY id DESC LIMIT 1",
-            (self.chat,),
+            (self.partition,),
         ).fetchone()
         return {
             **(dict(row) if row else {"state": "starting", "updated_at": None}),
             "last_gap": dict(last_gap) if last_gap else None,
         }
 
+    def sync_gaps(self, after_id: int, limit: int) -> list[dict]:
+        rows = self.connection.execute(
+            "SELECT id,reason,observed_at FROM sync_gaps WHERE chat=? AND id>? ORDER BY id LIMIT ?",
+            (self.partition, after_id, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def messages(
         self, *, limit: int, after_id: int | None = None, q: str | None = None,
         for_model: bool = False,
     ) -> list[dict]:
         conditions = ["chat=?"]
-        parameters: list = [self.chat]
+        parameters: list = [self.partition]
         if after_id is not None:
             conditions.append("id>?")
             parameters.append(after_id)
@@ -253,25 +280,31 @@ class Store:
         ).fetchall()
         if after_id is None:
             rows.reverse()
-        messages = []
-        for row in rows:
-            record = {
-                "author_kind": "unknown", "author_source": None, "outbound_draft_id": None,
-                "reply_text": None, "quote": None, **json.loads(row["record"]), "id": row["id"],
-            }
-            if (record["type"] == "text" and record["source"] == "accessibility"
-                    and record["text"] and record["quote"] is None):
-                if parts := split_wechat_quote(record["text"]):
-                    record["reply_text"], record["quote"] = parts
-            self._resolve_quote(record)
-            messages.append(record)
-        return messages
+        return [self._format_message(row) for row in rows]
+
+    def get_message(self, message_id: int) -> dict | None:
+        row = self.connection.execute(
+            "SELECT id,record FROM messages WHERE chat=? AND id=?", (self.partition, message_id),
+        ).fetchone()
+        return self._format_message(row) if row is not None else None
+
+    def _format_message(self, row: sqlite3.Row) -> dict:
+        record = {
+            "author_kind": "unknown", "author_source": None, "outbound_draft_id": None,
+            "reply_text": None, "quote": None, **json.loads(row["record"]), "id": row["id"],
+        }
+        if (record["type"] == "text" and record["source"] == "accessibility"
+                and record["text"] and record["quote"] is None):
+            if parts := split_wechat_quote(record["text"]):
+                record["reply_text"], record["quote"] = parts
+        self._resolve_quote(record)
+        return record
 
     def media(self, message_id: int, index: int = 0) -> Path | None:
         if type(index) is not int or index < 0:
             return None
         row = self.connection.execute(
-            "SELECT record FROM messages WHERE chat=? AND id=?", (self.chat, message_id)
+            "SELECT record FROM messages WHERE chat=? AND id=?", (self.partition, message_id)
         ).fetchone()
         if row is None:
             return None
@@ -329,12 +362,12 @@ class Store:
                                       created_at,updated_at)
                    VALUES (?,?,?,?,?,?,?,'pending',?,?)
                    ON CONFLICT(chat,origin,request_id) DO NOTHING RETURNING *""",
-                (self.chat, text, origin, request_id, auto_send, quote_message_id, author_kind, stamp, stamp),
+                (self.partition, text, origin, request_id, auto_send, quote_message_id, author_kind, stamp, stamp),
             ).fetchone()
             if row is None:
                 row = db.execute(
                     "SELECT * FROM drafts WHERE chat=? AND origin=? AND request_id=?",
-                    (self.chat, origin, request_id),
+                    (self.partition, origin, request_id),
                 ).fetchone()
                 if (row["text"] != text or bool(row["auto_send"]) != auto_send
                         or row["quote_message_id"] != quote_message_id
@@ -343,28 +376,28 @@ class Store:
                 if row["author_kind"] == "unknown" and row["status"] == "pending":
                     row = db.execute(
                         "UPDATE drafts SET author_kind=? WHERE id=? AND chat=? RETURNING *",
-                        (author_kind, row["id"], self.chat),
+                        (author_kind, row["id"], self.partition),
                     ).fetchone()
-        return dict(row)
+        return {**dict(row), "chat": self.chat}
 
     def get_draft(self, draft_id: int) -> dict | None:
         row = self.connection.execute(
-            "SELECT * FROM drafts WHERE chat=? AND id=?", (self.chat, draft_id)
+            "SELECT * FROM drafts WHERE chat=? AND id=?", (self.partition, draft_id)
         ).fetchone()
-        return dict(row) if row else None
+        return {**dict(row), "chat": self.chat} if row else None
 
     def list_drafts(self, limit: int) -> list[dict]:
         rows = self.connection.execute(
-            "SELECT * FROM drafts WHERE chat=? ORDER BY id DESC LIMIT ?", (self.chat, limit)
+            "SELECT * FROM drafts WHERE chat=? ORDER BY id DESC LIMIT ?", (self.partition, limit)
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [{**dict(row), "chat": self.chat} for row in rows]
 
     def claim_draft(self, draft_id: int) -> bool:
         with self.transaction() as db:
             result = db.execute(
                 """UPDATE drafts SET status='sending',updated_at=?
                    WHERE chat=? AND id=? AND status='pending'""",
-                (now().isoformat(), self.chat, draft_id),
+                (now().isoformat(), self.partition, draft_id),
             )
             return result.rowcount == 1
 
@@ -373,7 +406,7 @@ class Store:
             changed = db.execute(
                 """UPDATE drafts SET submission_anchors=?,updated_at=?
                    WHERE chat=? AND id=? AND status='sending' AND submission_anchors IS NULL""",
-                (json.dumps(anchors), now().isoformat(), self.chat, draft_id),
+                (json.dumps(anchors), now().isoformat(), self.partition, draft_id),
             )
             if changed.rowcount != 1:
                 raise ValueError("The draft could not record its pre-send snapshot")
@@ -383,7 +416,7 @@ class Store:
             """SELECT id,text,quote_message_id,submission_anchors FROM drafts
                WHERE chat=? AND author_kind IN ('llm','unknown') AND status='uncertain'
                AND submission_anchors IS NOT NULL ORDER BY id""",
-            (self.chat,),
+            (self.partition,),
         )]
 
     def _finish_draft(self, db, draft_id: int, status: str, detail: str | None, *, keep_submission: bool) -> bool:
@@ -391,7 +424,7 @@ class Store:
             """UPDATE drafts SET status=?,detail=?,updated_at=?,
                                  submission_anchors=CASE WHEN ? THEN submission_anchors END
                WHERE chat=? AND id=? AND status='sending'""",
-            (status, detail, now().isoformat(), keep_submission, self.chat, draft_id),
+            (status, detail, now().isoformat(), keep_submission, self.partition, draft_id),
         )
         return updated.rowcount == 1
 
@@ -408,7 +441,7 @@ class Store:
             """SELECT id,kind,text,created_at FROM memories
                WHERE chat=? AND (? IS NULL OR instr(lower(text),lower(?))>0)
                ORDER BY id DESC LIMIT ?""",
-            (self.chat, q, q, limit),
+            (self.partition, q, q, limit),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -417,12 +450,12 @@ class Store:
             row = db.execute(
                 """INSERT INTO memories(chat,kind,text,request_id,created_at)
                    VALUES (?,?,?,?,?) ON CONFLICT(chat,request_id) DO NOTHING RETURNING *""",
-                (self.chat, kind, text, request_id, now().isoformat()),
+                (self.partition, kind, text, request_id, now().isoformat()),
             ).fetchone()
             if row is None:
                 row = db.execute(
-                    "SELECT * FROM memories WHERE chat=? AND request_id=?", (self.chat, request_id)
+                    "SELECT * FROM memories WHERE chat=? AND request_id=?", (self.partition, request_id)
                 ).fetchone()
                 if (row["kind"], row["text"]) != (kind, text):
                     raise ValueError("request_id already belongs to a different memory")
-        return dict(row)
+        return {**dict(row), "chat": self.chat}

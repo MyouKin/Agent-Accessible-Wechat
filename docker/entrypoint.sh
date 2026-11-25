@@ -2,16 +2,34 @@
 set -euo pipefail
 umask 077
 
-mkdir -p "$XDG_RUNTIME_DIR"
-chmod 0700 "$XDG_RUNTIME_DIR"
-
 : "${BRIDGE_TOKEN:?Set BRIDGE_TOKEN before starting the bridge}"
 if [[ ! "${VNC_PASSWORD:-}" =~ ^[a-zA-Z0-9]{8}$ ]]; then
   echo "VNC_PASSWORD must contain exactly 8 ASCII letters or digits" >&2
   exit 1
 fi
+export WECHAT_TOOLS_ENABLED="${WECHAT_TOOLS_ENABLED:-true}"
+case "$WECHAT_TOOLS_ENABLED" in
+  true)
+    # Both local processes receive the same ephemeral credential for the private socket.
+    WECHAT_TOOLS_TOKEN="${WECHAT_TOOLS_TOKEN:-$(python3 -c 'from secrets import token_hex; print(token_hex(24))')}"
+    export WECHAT_TOOLS_TOKEN
+    ;;
+  false) ;;
+  *) echo "WECHAT_TOOLS_ENABLED must be true or false" >&2; exit 1 ;;
+esac
 
-mkdir -p /data
+# Hold this lock for the lifetime of the desktop using the shared WeChat profile.
+exec 9>>/home/wechat/.agent-accessible-wechat-desktop.lock
+if ! flock -n 9; then
+  echo "The WeChat home volume is already in use by a desktop" >&2
+  exit 1
+fi
+
+mkdir -p /data "$XDG_RUNTIME_DIR"
+chmod 0700 "$XDG_RUNTIME_DIR"
+export AAW_DESKTOP_LOCK="$XDG_RUNTIME_DIR/desktop-operations.lock"
+export AAW_WECHAT_TOOLS_SOCKET="$XDG_RUNTIME_DIR/wechat-tools.sock"
+export WECHAT_MCP_HOME=/wechat-tools
 : > "$XAUTHORITY"
 xauth -q -f "$XAUTHORITY" add "$DISPLAY" MIT-MAGIC-COOKIE-1 "$(mcookie)"
 
@@ -105,8 +123,15 @@ children["$!"]="x11vnc"
 websockify --web=/usr/share/novnc 0.0.0.0:6080 127.0.0.1:5900 &
 children["$!"]="websockify"
 
-env -u BRIDGE_TOKEN -u MCP_TOKEN /opt/wechat/wechat &
-children["$!"]="WeChat"
+if [[ "$WECHAT_TOOLS_ENABLED" == "true" ]]; then
+  rm -f "$AAW_WECHAT_TOOLS_SOCKET"
+  env -u BRIDGE_TOKEN -u MCP_TOKEN \
+    PYTHONPATH=/app:/opt/operator /opt/operator-venv/bin/python -m bridge_operator &
+  children["$!"]="WeChat tools worker"
+else
+  env -u BRIDGE_TOKEN -u MCP_TOKEN -u WECHAT_TOOLS_TOKEN /opt/wechat/wechat &
+  children["$!"]="WeChat"
+fi
 
 "$@" &
 bridge_pid=$!

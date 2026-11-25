@@ -13,13 +13,15 @@ import re
 import subprocess
 import tempfile
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import cached_property
 from importlib import import_module
+from itertools import islice
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -33,6 +35,26 @@ EVENT_TYPES = (
 )
 URL_PATTERN = re.compile(r"https?://[^\s<>\u3000-\u303f\uff00-\uffef]+", re.I)
 Bounds = tuple[int, int, int, int]
+ChatKind = Literal["group", "private"]
+
+# Linux accessibility labels reported in the upstream WeChat list reader.
+# https://github.com/zongwei-tang/wechat-mcp/blob/1a559f614c43e28abb2ec9936a5ad39579312916/wechat_mcp/wechat.py
+_WECHAT_LABEL_TYPES = {
+    "图片": "image", "Photo": "image", "Image": "image", "视频": "video", "Video": "video",
+    "语音": "voice", "文件": "file", "链接": "link", "聊天记录": "chat_record",
+    "小程序": "mini_program", "位置": "location", "名片": "contact_card",
+    "转账": "money", "红包": "money", "动画表情": "sticker", "表情": "sticker",
+}
+_EXTRA_MESSAGE_TYPES = frozenset(_WECHAT_LABEL_TYPES.values()) - {"image", "sticker", "link"}
+_WECHAT_LABEL_MARKER = re.compile(r"\[([^\[\]\r\n]{1,12})\](?:[ \t]+[^\r\n]+)?")
+_WECHAT_CLOCK = re.compile(r"(?:[01]?\d|2[0-3]):[0-5]\d(?:[ \t]+[AP]M)?", re.I)
+_WECHAT_EN_DATE = re.compile(
+    r"today|yesterday|mon(?:day)?\.?|tue(?:sday)?\.?|wed(?:nesday)?\.?|thu(?:rsday)?\.?|"
+    r"fri(?:day)?\.?|sat(?:urday)?\.?|sun(?:day)?\.?|\d{1,2}/\d{1,2}(?:/(?:\d{2}|\d{4}))?|"
+    r"\d{4}-\d{1,2}-\d{1,2}", re.I,
+)
+_WECHAT_ZH_DATE = re.compile(r"(?:昨天|前天|(?:星期|周)[一二三四五六日天]|(?:\d{4}年)?\d{1,2}月\d{1,2}日)")
+_WECHAT_ZH_PERIOD = re.compile(r"(?:上午|下午|凌晨|中午|晚上)\s*")
 
 
 class ReadError(RuntimeError):
@@ -298,7 +320,9 @@ class Profile:
     tail: Selector | None = None
     scrollbar: Selector | None = None
     group_count: Selector | None = None
+    private_header: Selector | None = None
     quote_preview: Selector | None = None
+    message_type_selectors: tuple[tuple[str, Selector], ...] = ()
     timestamp_format: str | None = None
     timestamp_timezone: str | None = None
     sender_id_attribute: str | None = None
@@ -307,6 +331,7 @@ class Profile:
     tail_from_last_row: bool = False
     tail_is_minimum: bool = False
     bubble_fallback: bool = True
+    wechat_label_hints: bool = False
     time_separator_height: int = 0
     image_minimum_row_height: int = 0
     recovery_step: float = 0
@@ -330,10 +355,19 @@ class Profile:
             raise ValueError("package_version must exactly identify the installed WeChat package")
         for key in ("window", "chat_header", "message_list", "message_row", "input", "sender",
                     "body", "image", "sticker", "link", "timestamp", "self_marker", "other",
-                    "non_message", "tail", "scrollbar", "group_count", "quote_preview"):
+                    "non_message", "tail", "scrollbar", "group_count", "private_header", "quote_preview"):
             if key in options and (options[key] is not None or key in required):
                 options[key] = Selector.parse(options[key])
-        for key in ("reverse", "tail_from_last_row", "tail_is_minimum", "bubble_fallback"):
+        if (marker := options.get("private_header")) is not None and not (
+            marker.name or marker.description or marker.accessible_id or marker.attributes
+        ):
+            raise ValueError("private_header must identify a verified private-chat control")
+        if "message_type_selectors" in options:
+            selectors = options["message_type_selectors"]
+            if not isinstance(selectors, dict) or selectors.keys() - _EXTRA_MESSAGE_TYPES:
+                raise ValueError("message_type_selectors must map supported non-text types to selectors")
+            options["message_type_selectors"] = tuple((kind, Selector.parse(value)) for kind, value in selectors.items())
+        for key in ("reverse", "tail_from_last_row", "tail_is_minimum", "bubble_fallback", "wechat_label_hints"):
             if key in options and type(options[key]) is not bool:
                 raise ValueError(f"{key} must be a boolean")
         for key, maximum in (("max_rows", 500), ("recovery_pages", 10)):
@@ -379,6 +413,7 @@ _WECHAT_ARM64_EN_PROFILE = {
     "image_minimum_row_height": 100,
     "time_separator_height": 41,
     "bubble_fallback": False,
+    "wechat_label_hints": True,
     "tail_from_last_row": True,
     "recovery_wheel_ticks": 2,
     "recovery_pages": 6,
@@ -390,6 +425,7 @@ class Target:
     pid: int
     window_bounds: Bounds
     input_bounds: Bounds
+    chat: str
 
 
 @dataclass
@@ -400,6 +436,7 @@ class _Chat:
     input: Node
     scrollbar: Node | None
     pid: int
+    kind: ChatKind | None
 
 
 def _selected(root: Node, selector: Selector | None) -> Node | None:
@@ -478,6 +515,69 @@ def urls_in(text: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(links))
 
 
+def _node_urls(node: Node) -> tuple[str, ...]:
+    try:
+        return tuple(url for url in node.uris if _http_url(url))
+    except Exception:
+        LOG.debug("An optional accessible link value could not be read", exc_info=True)
+        return ()
+
+
+def _link_child_urls(card: Node) -> tuple[str, ...]:
+    """Read only a small subtree of a profile-selected card, without opening it."""
+    remaining = 24
+    native: list[str] = []
+    visible: list[str] = []
+    pending = deque([(card, 0)])
+    while pending:
+        node, depth = pending.popleft()
+        if depth:
+            native.extend(_node_urls(node))
+            try:
+                if label := _label(node):
+                    visible.extend(urls_in(label))
+            except Exception:
+                LOG.debug("An optional link label could not be read", exc_info=True)
+        if depth < 3 and remaining:
+            try:
+                for child in islice(node.children(), remaining):
+                    pending.append((child, depth + 1))
+                    remaining -= 1
+            except Exception:
+                LOG.debug("Some accessible children of the link card are unavailable", exc_info=True)
+    return tuple(dict.fromkeys((*native, *visible)))
+
+
+def _wechat_label_hint(label: str) -> tuple[str, bool] | None:
+    """Return a type hint and whether a dedicated bracketed marker was present."""
+    label = label.strip()
+    marker = _WECHAT_LABEL_MARKER.fullmatch(label)
+    if marker and (kind := _WECHAT_LABEL_TYPES.get(marker[1])):
+        if kind not in {"image", "sticker"} or marker.end(1) + 1 == len(label):
+            return kind, True
+    if kind := _WECHAT_LABEL_TYPES.get(label):
+        return kind, False
+    if re.fullmatch(r'\d{1,3}"', label):
+        return "voice", False
+    return None
+
+
+def _wechat_time_label(label: str) -> bool:
+    label = label.strip()
+    if _WECHAT_CLOCK.fullmatch(label):
+        return True
+    match = re.search(rf"(?<!\d){_WECHAT_CLOCK.pattern}$", label, re.I)
+    if match is None:
+        return False
+    prefix = label[:match.start()].strip()
+    if _WECHAT_EN_DATE.fullmatch(prefix):
+        return True
+    date = _WECHAT_ZH_DATE.match(prefix)
+    if date:
+        prefix = prefix[date.end():].strip()
+    return (not prefix and date is not None) or _WECHAT_ZH_PERIOD.fullmatch(prefix) is not None
+
+
 def parse_message(
     row: Node, profile: Profile, chat: str, observed_at: datetime,
 ) -> tuple[Message, Node | None]:
@@ -501,13 +601,10 @@ def parse_message(
     text = _label(body)
     if link is not None and not text:
         text = _label(link)
-    links = urls_in(text) if text else ()
-    if link is not None:
-        try:
-            link_urls = (url for url in link.uris if _http_url(url))
-            links = tuple(dict.fromkeys((*link_urls, *links)))
-        except Exception:
-            LOG.debug("An optional accessible Hyperlink value could not be read", exc_info=True)
+    body_links = urls_in(text) if text else ()
+    direct_links = _node_urls(link) if link is not None else ()
+    baseline_links = tuple(dict.fromkeys((*direct_links, *body_links)))
+    links = baseline_links if link is None else tuple(dict.fromkeys((*direct_links, *_link_child_urls(link), *body_links)))
     kind = "unknown"
     if media is not None:
         kind = "sticker" if sticker is not None else "image"
@@ -515,8 +612,27 @@ def parse_message(
         kind = "link"
     elif text:
         kind = "text"
+    baseline_kind = kind
 
     metadata: dict[str, Any] = {}
+    typed = [name for name, selector in profile.message_type_selectors if next(selector.find(row), None) is not None]
+    if len(typed) == 1:
+        kind = typed[0]
+        metadata["type_basis"] = "atspi_selector"
+    elif typed:
+        kind = "unknown"
+        metadata["type_hints"] = typed
+    elif profile.wechat_label_hints and kind == "text" and row.role == "list item" and text == row.name:
+        hint = _wechat_label_hint(text)
+        if hint is not None:
+            hinted_type, marked = hint
+            if marked and hinted_type == "image" and profile.image_minimum_row_height:
+                bounds = row.bounds
+                marked = bounds is not None and bounds[3] >= profile.image_minimum_row_height
+            kind = hinted_type if marked else "unknown"
+            metadata.update(type_hint=hinted_type, type_basis="wechat_accessible_label")
+    if kind not in {"image", "sticker"}:
+        media = None
     if raw_desc:
         metadata["raw_description"] = raw_desc
     if kind == "unknown":
@@ -534,9 +650,9 @@ def parse_message(
         metadata["accessible_timestamp"] = raw_time
     if links:
         metadata["urls"] = list(links)
-    if media is not None:
+    if kind in {"image", "sticker"}:
         metadata["capture_quality"] = "unavailable"
-    return Message(
+    message = Message(
         id=None, chat=chat, sender=_label(sender),
         sender_id=(sender or row).attributes.get(profile.sender_id_attribute)
         if profile.sender_id_attribute else None,
@@ -545,7 +661,11 @@ def parse_message(
         is_self=True if owns else False if other else None, source="accessibility",
         source_id=row.attributes.get(profile.source_id_attribute) if profile.source_id_attribute else None,
         metadata=metadata,
-    ), media
+    )
+    baseline_url = baseline_links[0] if baseline_links else None
+    if kind != baseline_kind or message.url != baseline_url:
+        metadata["observation_key"] = message_key(replace(message, type=baseline_kind, url=baseline_url))
+    return message, media
 
 
 class _Unavailable(ReadError):
@@ -709,6 +829,13 @@ def _box_center(bounds: Bounds, box: tuple[int, int, int, int]) -> tuple[int, in
     return bounds[0] + (box[0] + box[2]) // 2, bounds[1] + (box[1] + box[3]) // 2
 
 
+def _same_visible_crop(row: Bounds, box: tuple[int, int, int, int], expected: Any, window: Bounds, pid: int) -> bool:
+    left, top, right, bottom = box
+    bounds = (row[0] + left, row[1] + top, right - left, bottom - top)
+    actual = _capture_pixels(bounds, window, pid)
+    return bool(actual is not None and actual[1] == bounds and actual[0].tobytes() == expected.tobytes())
+
+
 def _escape_from_window(window: Bounds, pid: int, *, window_id: int | None = None) -> bool:
     from Xlib import X, XK, display
     from Xlib.ext import xtest
@@ -740,16 +867,19 @@ def _scroll_wheel(chat: _Chat, button: int, ticks: int) -> bool:
         active = _active_x11(connection, window_bounds, chat.pid)
         if active is None:
             return False
-        root, _window = active
+        root, window = active
         pointer = root.query_pointer()
         geometry = root.get_geometry()
         bounded = intersection(panel_bounds, (0, 0, geometry.width, geometry.height))
         if bounded is None:
             return False
         x, y, width, height = bounded
+        x, y = x + width // 2, y + height // 2
+        if not _unobscured_x11(connection, root, window, (x, y, 1, 1)):
+            return False
         try:
             subprocess.run([
-                "xdotool", "mousemove", str(x + width // 2), str(y + height // 2),
+                "xdotool", "mousemove", str(x), str(y),
                 "click", "--repeat", str(ticks), str(button),
             ], check=True, timeout=3, capture_output=True)
         finally:
@@ -805,6 +935,8 @@ class AccessibilitySource:
         if not math.isfinite(poll_interval) or poll_interval <= 0:
             raise ValueError("poll_interval must be finite and positive")
         self.chat = chat
+        self._target_kind: ChatKind | None = None
+        self._chat_kind: ChatKind | None = None
         self._preset = profile if isinstance(profile, str) else None
         if self._preset is not None:
             if self._preset != "wechat-4.1.13.29-arm64-en":
@@ -831,6 +963,19 @@ class AccessibilitySource:
         self._last_read: Snapshot | None = None
         self._capture_origin: tuple[Snapshot, tuple[Any, ...]] | None = None
 
+    async def set_target(self, chat: str, kind: ChatKind | None = None) -> None:
+        """Rebind under the caller's operation lock without moving the desktop."""
+        if not isinstance(chat, str) or kind not in (None, "group", "private"):
+            raise ValueError("A WeChat target requires a title and a supported chat kind")
+        self.chat, self._target_kind = chat, kind
+        self._state = "waiting_for_target" if chat else "unconfigured"
+        self._at_tail = False
+        self._chat_kind = None
+        self._app_pid = None
+        self._last_read = None
+        self._capture_origin = None
+        self._changed.set()
+
     async def start(self) -> None:
         if self._executor is not None:
             return
@@ -852,6 +997,7 @@ class AccessibilitySource:
             self._executor = None
         self._state = "stopped"
         self._at_tail = False
+        self._chat_kind = None
         self._last_read = None
         self._capture_origin = None
 
@@ -934,10 +1080,12 @@ class AccessibilitySource:
         return {
             "source": "accessibility", "state": self._state, "ready": self._state == "ready",
             "chat": self.chat, "wechat_version": self._version, "events": bool(self._registered),
-            "at_tail": self._at_tail,
+            "at_tail": self._at_tail, "target_kind": self._target_kind, "chat_kind": self._chat_kind,
         }
 
     def _chat(self) -> _Chat:
+        if not self.chat:
+            raise _Unavailable("unconfigured")
         if self._atspi is None:
             raise _Unavailable("atspi_unavailable")
         candidates = [node for node in desktop_nodes(self._atspi) if wechat_app(node)]
@@ -965,27 +1113,83 @@ class AccessibilitySource:
         if header is None:
             raise _Unavailable("profile_mismatch")
         self._verify_header(header)
-        if profile.group_count is not None:
-            group_count = profile.group_count.one(window)
-            if group_count is None or not group_count.showing or not re.fullmatch(r"\(\d+\)", group_count.name):
-                raise _Unavailable("profile_mismatch")
+        kind = self._verify_chat_kind(window, header)
         panel = profile.message_list.one(window)
         input_field = profile.input.one(window)
         if panel is None or input_field is None or not panel.showing or not input_field.showing:
             raise _Unavailable("profile_mismatch")
-        return _Chat(window, header, panel, input_field, _selected(window, profile.scrollbar), self._app_pid)
+        return _Chat(window, header, panel, input_field, _selected(window, profile.scrollbar), self._app_pid, kind)
 
     def _verify_header(self, header: Node) -> None:
         header.refresh()
         if not header.showing:
             raise _Unavailable("profile_mismatch")
         title = header.text or header.name
-        if not title or title.strip() != self.chat:
+        if not title or title != self.chat:
             raise _Unavailable("chat_mismatch")
+
+    def _verify_chat_kind(self, window: Node, header: Node) -> ChatKind | None:
+        if self._preset is not None and self._target_kind == "private":
+            kind = self._wechat_title_kind(window, header)
+            if kind != "private":
+                raise _Unavailable("chat_kind_mismatch" if kind else "chat_kind_unverified")
+            return kind
+
+        group_count = _selected(window, self.profile.group_count)
+        group = False
+        if group_count is not None:
+            group_count.refresh()
+            if group_count.showing:
+                if not re.fullmatch(r"\(\d+\)", group_count.name):
+                    raise _Unavailable("chat_kind_unverified" if self._target_kind else "profile_mismatch")
+                group = True
+        if self._target_kind is None:
+            if self.profile.group_count is not None and not group:
+                raise _Unavailable("profile_mismatch")
+            return "group" if group else None
+        if self._preset is not None:
+            private = not group and self._wechat_title_kind(window, header) == "private"
+        else:
+            marker = _selected(window, self.profile.private_header)
+            if marker is not None:
+                marker.refresh()
+            private = marker is not None and marker.native != header.native and marker.showing
+        if group == private:
+            raise _Unavailable("chat_kind_unverified")
+        kind = "group" if group else "private"
+        if self._target_kind != kind:
+            raise _Unavailable("chat_kind_mismatch")
+        return kind
+
+    @staticmethod
+    def _wechat_title_kind(window: Node, header: Node) -> ChatKind | None:
+        # Count-slot absence is evidence only in the intact, versioned title container.
+        parent = Selector(path=tuple(_WECHAT_TITLE)).one(window)
+        if parent is None:
+            return None
+        parent.refresh()
+        if not parent.showing:
+            return None
+        children = tuple(islice(parent.children(), 3))
+        if not children or children[0].native != header.native:
+            return None
+        if len(children) == 1:
+            return "private"
+        count_slot = children[1]
+        count_slot.refresh()
+        if count_slot.role != "label":
+            return None
+        if count_slot.showing:
+            return "group" if re.fullmatch(r"\(\d+\)", count_slot.name) else None
+        if (len(children) == 2 and count_slot.states
+                and not count_slot.states & {"defunct", "showing", "visible"}
+                and not (count_slot.text or count_slot.name)):
+            return "private"
+        return None
 
     def _verify_chat(self, before: _Chat) -> None:
         after = self._chat()
-        if before.pid != after.pid or any(
+        if before.pid != after.pid or before.kind != after.kind or any(
             getattr(before, name).native != getattr(after, name).native
             for name in ("window", "header", "panel", "input")
         ):
@@ -1010,15 +1214,32 @@ class AccessibilitySource:
     async def get_target(self) -> Target | None:
         return await self._call(self._target)
 
+    @staticmethod
+    def _ambiguous_sidebar_title(window: Node, title: str) -> bool:
+        """Detect conflicting titles when the supported desktop exposes its sidebar."""
+        try:
+            sidebar = next(Selector(role="list", name="Chats").find(window), None)
+            if sidebar is None or not sidebar.showing:
+                return False
+            matches = (
+                row for row in islice(sidebar.children(), 200)
+                if row.role == "list item" and row.name.partition("\n")[0].strip() == title
+            )
+            return len(tuple(islice(matches, 2))) == 2
+        except ReadError:
+            return False
+
     def _target(self) -> Target | None:
         try:
             chat = self._chat()
+            if self._preset and self._target_kind and self._ambiguous_sidebar_title(chat.window, self.chat):
+                return None
             window_bounds = chat.window.bounds
             input_bounds = chat.input.bounds
             if input_bounds is None or intersection(window_bounds, input_bounds) != input_bounds:
                 return None
             self._verify_chat(chat)
-            return Target(chat.pid, window_bounds, input_bounds)
+            return Target(chat.pid, window_bounds, input_bounds, self.chat)
         except Exception:
             return None
 
@@ -1068,7 +1289,7 @@ class AccessibilitySource:
         result = {
             "state": "unconfigured", "at_tail": False, "visible_rows": 0, "message_types": [],
             "x11_target_active": False, "composer": "unverified", "quote_preview": "unverified",
-            "manual_send_preconditions": False,
+            "manual_send_preconditions": False, "target_kind": self._target_kind, "chat_kind": None,
         }
         if not self.chat:
             return result
@@ -1080,7 +1301,8 @@ class AccessibilitySource:
         except Exception:
             return {**result, "state": "stale_nodes"}
         result.update(state="ready" if snapshot.at_tail else "reading_history", at_tail=snapshot.at_tail,
-                      visible_rows=len(snapshot.messages), message_types=sorted({m.type for m in snapshot.messages}))
+                      visible_rows=len(snapshot.messages), message_types=sorted({m.type for m in snapshot.messages}),
+                      chat_kind=chat.kind)
 
         try:
             chat.input.refresh()
@@ -1115,6 +1337,24 @@ class AccessibilitySource:
                 return await self._call(self._snapshot, True)
         return await self._call(self._snapshot, False)
 
+    async def prepare_target(self) -> Snapshot:
+        """Return a fresh target snapshot, trying the profile's bounded tail navigation if needed."""
+        snapshot = await self.read_snapshot(capture_media=False)
+        profile = self.profile
+        if not snapshot.ready or snapshot.at_tail or not profile or not (
+            profile.recovery_wheel_ticks or profile.recovery_step
+        ):
+            return snapshot
+        from .desktop import pause_vnc_input
+
+        async with self.desktop_lock:
+            try:
+                async with pause_vnc_input():
+                    await self._call(self._restore_tail)
+            except Exception:
+                LOG.debug("Cannot prepare the target at the latest messages", exc_info=True)
+            return await self._call(self._snapshot, False)
+
     def _snapshot(self, capture_media: bool) -> Snapshot:
         try:
             chat = self._chat()
@@ -1124,13 +1364,14 @@ class AccessibilitySource:
             self._capture_origin = (snapshot, tuple(row.native for row, _, _ in parsed))
             self._state = "ready" if snapshot.at_tail else "reading_history"
             self._at_tail = snapshot.at_tail
+            self._chat_kind = chat.kind
             return snapshot
         except _Unavailable as error:
             self._state = error.state
         except Exception:
             LOG.debug("Discarded an inconsistent AT-SPI snapshot", exc_info=True)
             self._state = "stale_nodes"
-        self._at_tail, self._capture_origin = False, None
+        self._at_tail, self._chat_kind, self._capture_origin = False, None, None
         return Snapshot(chat=self.chat, messages=(), at_tail=False, ready=False)
 
     def _read_chat(self, chat: _Chat) -> tuple[Snapshot, list[tuple[Node, Message, Node | None]]]:
@@ -1147,7 +1388,7 @@ class AccessibilitySource:
         for row in rows:
             if _selected(row, profile.non_message) is not None:
                 continue
-            if profile.time_separator_height and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", row.name):
+            if profile.time_separator_height and _wechat_time_label(row.name):
                 bounds = row.bounds
                 if bounds is not None and bounds[3] == profile.time_separator_height:
                     separator = row.name
@@ -1161,6 +1402,8 @@ class AccessibilitySource:
         return Snapshot(chat=self.chat, messages=messages, at_tail=at_tail), parsed
 
     async def capture_messages(self, snapshot: Snapshot, indices: Iterable[int]) -> tuple[Message, ...]:
+        if snapshot.chat != self.chat:
+            raise ReadError("The observation belongs to a different WeChat target")
         selected = tuple(indices)
         unchanged = tuple(snapshot.messages[index] for index in selected)
         if not unchanged or (
@@ -1321,6 +1564,8 @@ class AccessibilitySource:
                     if not self.profile.bubble_fallback:
                         continue
                     candidate = row.bounds
+                    if candidate is None or candidate[2] >= panel_bounds[2]:
+                        continue
                     quality = "bubble_bounds"
                 area = intersection(candidate, panel_bounds)
                 if area is not None:
@@ -1367,7 +1612,7 @@ class AccessibilitySource:
                         box = image_preview_box(row_image, layout)
                         if box is not None:
                             try:
-                                native_crop = self._capture_native_image(chat, row, bounds, box)
+                                native_crop = self._capture_native_image(chat, row, bounds, box, row_image.crop(box))
                             except Exception:
                                 LOG.debug("Could not verify the native photo viewer", exc_info=True)
                     if native_crop is not None:
@@ -1381,7 +1626,10 @@ class AccessibilitySource:
                         and layout.bubble_box is not None):
                     lookups += 1
                     try:
-                        nickname = self._lookup_group_alias(chat, row, bounds, layout.avatar_box)
+                        nickname = self._lookup_group_alias(
+                            chat, row, bounds, layout.avatar_box, message.metadata.get("raw_description"),
+                            row_image.crop(layout.avatar_box),
+                        )
                     except Exception:
                         LOG.debug("Could not verify the member's native group alias", exc_info=True)
                         break
@@ -1413,7 +1661,7 @@ class AccessibilitySource:
                 LOG.debug("Cannot write accessible media file", exc_info=True)
         return tuple(messages)
 
-    def _capture_native_image(self, chat: _Chat, row: Node, bounds: Bounds, box) -> Any:
+    def _capture_native_image(self, chat: _Chat, row: Node, bounds: Bounds, box, expected: Any) -> Any:
         from Xlib import X, display
 
         from .wechat_images import find_image_viewer
@@ -1423,7 +1671,8 @@ class AccessibilitySource:
         chat.input.refresh()
         window = chat.window.bounds
         if (window is None or row.bounds != bounds or row.name != "Image"
-                or intersection(bounds, chat.panel.bounds) != bounds or chat.input.text != ""):
+                or intersection(bounds, chat.panel.bounds) != bounds or chat.input.text != ""
+                or self._quote_preview_state(chat.window) != "clear"):
             return None
         parent = chat.window.native.get_parent()
         if parent is None:
@@ -1436,7 +1685,8 @@ class AccessibilitySource:
         connection = display.Display()
         try:
             main = _active_x11(connection, window, chat.pid)
-            if main is None or not _click_from_window(_box_center(bounds, box), window, chat.pid):
+            if (main is None or not _same_visible_crop(bounds, box, expected, window, chat.pid)
+                    or not _click_from_window(_box_center(bounds, box), window, chat.pid, window_id=main[1])):
                 return None
             for _ in range(12):
                 time.sleep(0.07)
@@ -1483,19 +1733,30 @@ class AccessibilitySource:
         finally:
             connection.close()
 
-    def _lookup_group_alias(self, chat: _Chat, row: Node, bounds: Bounds, avatar_box) -> str | None:
+    def _lookup_group_alias(
+        self, chat: _Chat, row: Node, bounds: Bounds, avatar_box, label: str | None, expected: Any,
+    ) -> str | None:
         from .wechat_actions import identify_profile_popup
 
         self._verify_chat(chat)
+        row.refresh()
         chat.input.refresh()
-        if chat.input.text != "" or row.bounds != bounds or chat.window.bounds is None:
+        window = chat.window.bounds
+        if (window is None or not label or row.name != label or row.bounds != bounds
+                or intersection(bounds, chat.panel.bounds) != bounds or chat.input.text != ""
+                or self._quote_preview_state(chat.window) != "clear"):
             return None
         parent = chat.window.native.get_parent()
         if parent is None:
             return None
         app = Node(parent, self._atspi)
+        visible = [node for node in app.children() if node.showing]
+        if len(visible) != 1 or visible[0].native != chat.window.native:
+            return None
         point = _box_center(bounds, avatar_box)
-        if not _click_from_window(point, chat.window.bounds, chat.pid):
+        if not _same_visible_crop(bounds, avatar_box, expected, window, chat.pid) or not _click_from_window(
+            point, window, chat.pid,
+        ):
             return None
         for _ in range(8):
             time.sleep(0.06)
@@ -1548,7 +1809,8 @@ class AccessibilitySource:
 
     async def recover(self, previous: Snapshot, current: Snapshot) -> Snapshot | None:
         profile = self.profile
-        if not profile or not (profile.recovery_step or profile.recovery_wheel_ticks) or not current.at_tail:
+        if (previous.chat != self.chat or current.chat != self.chat or not profile
+                or not (profile.recovery_step or profile.recovery_wheel_ticks) or not current.at_tail):
             return None
         from .desktop import pause_vnc_input
 

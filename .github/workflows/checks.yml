@@ -33,6 +33,7 @@ jobs:
     timeout-minutes: 30
     env:
       CI_BRIDGE_TOKEN: ci-smoke-only-bridge-token-12345
+      CI_MCP_TOKEN: ci-mcp-smoke-only-token-12345678
     strategy:
       fail-fast: false
       matrix:
@@ -47,11 +48,15 @@ jobs:
           persist-credentials: false
       - name: Build the native image
         run: docker build -f docker/Dockerfile -t agent-accessible-wechat:ci .
-      - name: Start a private desktop with the sample configuration
+      - name: Start a private desktop with MCP enabled
         run: |
+          sed 's/^mcp_enabled: false/mcp_enabled: true/' config.yaml > "$RUNNER_TEMP/wechat-bridge-ci.yaml"
+          chmod 644 "$RUNNER_TEMP/wechat-bridge-ci.yaml"
           docker run --detach --name aaw-ci --network none --cap-drop ALL \
             --security-opt no-new-privileges:true --shm-size 256m \
             -e "BRIDGE_TOKEN=$CI_BRIDGE_TOKEN" -e VNC_PASSWORD=smoke123 \
+            -e "MCP_TOKEN=$CI_MCP_TOKEN" \
+            -v "$RUNNER_TEMP/wechat-bridge-ci.yaml:/app/config.yaml:ro" \
             agent-accessible-wechat:ci
       - name: Verify the WeChat package, Bridge API, noVNC and AT-SPI
         env:
@@ -80,6 +85,33 @@ jobs:
             sleep 1
           done
           exit 1
+      - name: Verify the shared 78-tool catalog through HTTP and MCP
+        run: |
+          for attempt in {1..45}; do
+            test "$(docker inspect --format '{{.State.Running}}' aaw-ci)" = true
+            if docker exec aaw-ci curl -fsS --max-time 2 http://127.0.0.1:8765/wechat/health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec aaw-ci curl -fsS http://127.0.0.1:8765/wechat/health
+          docker exec aaw-ci curl -fsS http://127.0.0.1:8765/wechat/login >/dev/null
+          code=$(docker exec aaw-ci curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/sessions)
+          test "$code" = 401
+          code=$(docker exec aaw-ci curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $CI_BRIDGE_TOKEN" http://127.0.0.1:8765/sessions)
+          test "$code" = 409
+          code=$(docker exec aaw-ci curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/wechat/login/state)
+          test "$code" = 401
+          code=$(docker exec aaw-ci curl -sS -o /dev/null -w '%{http_code}' -H 'Host: example.test' http://127.0.0.1:8765/wechat/health)
+          test "$code" = 403
+          docker exec aaw-ci curl -fsS http://127.0.0.1:8765/tools \
+            -H "Authorization: Bearer $CI_BRIDGE_TOKEN" > "$RUNNER_TEMP/wechat-http-tools.json"
+          docker exec aaw-ci curl -fsS http://127.0.0.1:8765/mcp \
+            -H "Authorization: Bearer $CI_MCP_TOKEN" -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+            | python3 -c 'import json,sys; tools=json.load(sys.stdin)["result"]["tools"]; http=json.load(open(sys.argv[1]))["tools"]; names={tool["name"] for tool in tools}; assert len(tools)==len(names)==len(http)==78 and {t["name"]:t["inputSchema"] for t in tools}=={t["name"]:t["inputSchema"] for t in http}; assert {"get_status","get_message","draft_message","get_configured_chat_messages","wechat_read_current_chat","wechat_status","wechat_send_file","wechat_ui_tree"} <= names' "$RUNNER_TEMP/wechat-http-tools.json"
       - name: Collect logs on failure
         if: failure()
         run: docker logs aaw-ci || true

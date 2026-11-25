@@ -58,6 +58,25 @@ class SyntheticSource:
         return self.recovered
 
 
+async def test_wait_for_messages_wakes_all_waiters_after_commit(tmp_path):
+    store = Store(tmp_path, "test")
+    try:
+        source = SyntheticSource(snapshot("A"))
+        sync = Synchronizer(source, store, 0.5)
+        await sync.step()
+        first = asyncio.create_task(sync.wait_for_messages(0, 1, 1))
+        second = asyncio.create_task(sync.wait_for_messages(0, 5, 1))
+        await asyncio.sleep(0)
+        assert not first.done() and not second.done()
+        source.current = snapshot("ABC")
+        await sync.step()
+        assert [row["text"] for row in await first] == ["B"]
+        assert [row["text"] for row in await second] == ["B", "C"]
+        assert await sync.wait_for_messages(2, 5, .01) == []
+    finally:
+        store.close()
+
+
 async def test_restart_and_off_target_do_not_reset_anchors(tmp_path):
     store = Store(tmp_path, "test")
     source = SyntheticSource(snapshot("ABC"))

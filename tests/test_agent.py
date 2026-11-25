@@ -4,16 +4,21 @@ import json
 import logging
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from PIL import Image
 
-from agent import AgentState, BridgeClient, Companion, Decision, Job, ModelClient, Settings, parse_decision, was_mentioned
+from agent import (
+    AgentState, BridgeClient, Companion, Decision, Job, LEGACY_WECHAT_CATALOG, ModelClient, Settings,
+    main, parse_decision, parse_plain_reply, quote_tool_decision, was_mentioned,
+)
 from bridge.config import Settings as BridgeSettings
 from bridge.models import Message, Snapshot
 from bridge.server import create_app
@@ -40,6 +45,189 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual(settings.model, "test")
             self.assertEqual(settings.poll_seconds, 10)
             self.assertEqual(settings.min_decision_interval, 60)
+            self.assertTrue(settings.wechat_tools)
+            with patch.dict("os.environ", {"AGENT_WECHAT_TOOLS": "false"}):
+                self.assertFalse(Settings.from_env().wechat_tools)
+
+    def test_session_commands_use_only_bridge_and_escape_terminal_controls(self):
+        unusual = {
+            "key": "session-unverified", "name": "测试群\n\x1b[31m\u202e", "kind": "unknown",
+            "native_id": None, "active": False,
+        }
+        verified = {**unusual, "key": "session-verified", "kind": "group", "active": True}
+        calls = []
+        real_client = httpx.AsyncClient
+
+        def handler(request):
+            self.assertEqual(request.headers["Authorization"], "Bearer synthetic-bridge-token")
+            self.assertEqual(request.url.host, "bridge.test")
+            calls.append((request.method, request.url.path))
+            if request.method == "GET":
+                return httpx.Response(200, json={"sessions": [unusual], "active": None, "complete": False})
+            self.assertEqual(json.loads(request.content), {"key": "session-unverified"})
+            return httpx.Response(200, json={"active": verified})
+
+        def mock_client(**kwargs):
+            self.assertIs(kwargs["trust_env"], False)
+            return real_client(**kwargs, transport=httpx.MockTransport(handler))
+
+        env = {
+            "BRIDGE_TOKEN": "synthetic-bridge-token", "AGENT_BRIDGE_URL": "http://bridge.test",
+            "AGENT_WECHAT_TOOLS": "unrelated-invalid-setting",
+        }
+        output = StringIO()
+        with patch.dict("os.environ", env, clear=True), patch("agent.httpx.AsyncClient", side_effect=mock_client):
+            with redirect_stdout(output):
+                with patch("sys.argv", ["agent", "--list-sessions"]):
+                    main()
+                with patch("sys.argv", ["agent", "--set-session", "session-unverified"]):
+                    main()
+        text = output.getvalue()
+        self.assertEqual(calls, [("GET", "/sessions"), ("PUT", "/sessions/active")])
+        self.assertIn("Native ID", text)
+        self.assertIn("Local key", text)
+        self.assertIn("unavailable", text)
+        self.assertIn("Session discovery is incomplete", text)
+        self.assertIn("session-verified", text)
+        self.assertIn(r"测试群\n\x1b[31m\u202e", text)
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\u202e", text)
+
+    def test_session_cli_explains_unavailable_or_unverified_sessions_without_private_details(self):
+        env = {"BRIDGE_TOKEN": "synthetic-bridge-token", "AGENT_BRIDGE_URL": "http://bridge.test"}
+        real_client = httpx.AsyncClient
+
+        for arguments, status, expected in (
+            (["--list-sessions"], 409, "Check that WeChat is signed in"),
+            (["--set-session", "session-removed"], 404, "Run --list-sessions again"),
+        ):
+            with self.subTest(arguments=arguments):
+                def mock_client(**kwargs):
+                    def handler(request):
+                        return httpx.Response(status, json={"detail": "UNFORWARDED_BRIDGE_DETAIL"})
+
+                    self.assertEqual(kwargs["timeout"], 85)
+                    return real_client(**kwargs, transport=httpx.MockTransport(handler))
+
+                errors = StringIO()
+                with (
+                    patch.dict("os.environ", env, clear=True),
+                    patch("sys.argv", ["agent", *arguments]),
+                    patch("agent.httpx.AsyncClient", side_effect=mock_client),
+                    redirect_stderr(errors),
+                ):
+                    with self.assertRaises(SystemExit) as stopped:
+                        main()
+                self.assertEqual(stopped.exception.code, 1)
+                self.assertIn(expected, errors.getvalue())
+                self.assertNotIn("UNFORWARDED_BRIDGE_DETAIL", errors.getvalue())
+
+    def test_set_session_run_requires_normal_agent_config_and_forwards_key(self):
+        env = {"BRIDGE_TOKEN": "synthetic-bridge-token", "LLM_BASE_URL": "http://127.0.0.1:8080/v1", "LLM_MODEL": "fake"}
+        with patch.dict("os.environ", env, clear=True), patch("agent.run", new_callable=AsyncMock) as run_agent:
+            with patch("sys.argv", ["agent", "--set-session", "session-key", "--run"]):
+                main()
+            settings, demo = run_agent.await_args.args
+            self.assertEqual(settings.model, "fake")
+            self.assertIs(demo, False)
+            self.assertEqual(run_agent.await_args.kwargs, {"session_key": "session-key"})
+
+    def test_binding_retains_legacy_group_cursor_and_resets_on_verified_kind_change(self):
+        with TemporaryDirectory() as directory, AgentState.open(Path(directory) / "agent.db") as state:
+            state.bind_chat("共享名称", 10)
+            state.bind_chat("共享名称", 24, session_key="legacy")
+            self.assertEqual(state.get("cursor"), 10)
+            state.bind_chat("共享名称", 24, session_key="native-key", session_kind="group")
+            self.assertEqual(state.get("cursor"), 10)
+            state.bind_chat("共享名称", 24, session_key="native-key", session_kind="private")
+            self.assertEqual(state.get("cursor"), 24)
+            self.assertEqual(state.get("session_kind"), "private")
+
+    def test_same_title_session_switch_clears_old_jobs_and_only_verified_private_peers_trigger(self):
+        async def exercise(state):
+            now = time.time()
+            chat = "合成测试群"
+            settings = Settings(selective=False)
+            group = {"key": "session-group", "kind": "group", "name": chat, "active": True}
+            private = {"key": "session-private", "kind": "private", "name": chat, "active": True}
+            active = group
+            sessions = {group["key"]: [], private["key"]: [message(100, now, "私聊已有历史")]}
+            drafts, model_triggers = [], []
+
+            def bridge_handler(request):
+                path = request.url.path
+                if path == "/status":
+                    return httpx.Response(200, json={
+                        "chat": chat, "source": {"ready": True}, "send_mode": "manual", "active_session": active,
+                    })
+                if request.method == "POST":
+                    self.assertEqual(path, "/drafts")
+                    draft = json.loads(request.content)
+                    self.assertEqual(draft["session_key"], private["key"])
+                    self.assertFalse(draft["auto_send"])
+                    drafts.append(draft)
+                    return httpx.Response(200, json={"id": len(drafts), "status": "pending"})
+                self.assertEqual(request.url.params["session_key"], active["key"])
+                rows = sessions[active["key"]]
+                if path == "/messages":
+                    return httpx.Response(200, json={"messages": rows[-int(request.url.params["limit"]):]})
+                if path == "/messages/new":
+                    after = int(request.url.params["after_id"])
+                    return httpx.Response(200, json={
+                        "messages": [row for row in rows if row["id"] > after][:int(request.url.params["limit"])],
+                    })
+                if path == "/messages/search":
+                    return httpx.Response(200, json={"messages": []})
+                if path == "/tools":
+                    self.assertEqual(request.url.params["scope"], "conversation")
+                    return httpx.Response(200, json={"tools": []})
+                self.assertEqual(path, "/memories")
+                return httpx.Response(200, json={"memories": []})
+
+            def model_handler(request):
+                payload = json.loads(request.content)
+                context = json.loads(payload["messages"][1]["content"])
+                model_triggers.append((context["trigger_id"], context["trigger_reason"], context["conversation_kind"]))
+                answer = '{"reply":"这是合成私聊应答"}'
+                return httpx.Response(200, json={"choices": [{"message": {"content": answer}}]})
+
+            async with httpx.AsyncClient(
+                base_url="http://bridge.test/", transport=httpx.MockTransport(bridge_handler),
+            ) as bridge_http, httpx.AsyncClient(
+                base_url="http://model.test/", transport=httpx.MockTransport(model_handler),
+            ) as model_http:
+                companion = Companion(settings, BridgeClient(bridge_http), ModelClient(model_http, "fake", "合成"), state)
+                await companion.poll_once(now)
+                sessions[group["key"]].append(message(1, now, "@阿桥 群里这条有待处理", author_kind="human"))
+                await companion.poll_once(now)
+                self.assertEqual(state.next_job(now).id, 1)
+
+                active = private
+                self.assertFalse(await companion.verify_ready(chat))
+                await companion.poll_once(now)
+                self.assertEqual(state.get("cursor"), 100)
+                self.assertEqual(state.get("session_key"), private["key"])
+                self.assertIsNone(state.next_job(now))
+
+                sessions[private["key"]].extend([
+                    message(101, now, "@阿桥 手机自己的消息", author_kind="human", is_self=True),
+                    message(102, now, "模型自己的消息", author_kind="llm"),
+                    message(103, now, "方向未知", author_kind="human", is_self=None),
+                    message(104, now, "作者未确认", author_kind="unknown"),
+                    message(105, now, "今天怎么样", author_kind="human"),
+                    message(106, now, "下班了吗", author_kind="human"),
+                ])
+                await companion.poll_once(now)
+                await companion.respond_once(now)
+                await companion.respond_once(now)
+                await companion.respond_once(now)
+            self.assertIsNone(state.next_job(now))
+            self.assertEqual(state.get("cursor"), 106)
+            self.assertEqual(model_triggers, [(105, "private-message", "private"), (106, "private-message", "private")])
+            self.assertEqual(len(drafts), 2)
+
+        with TemporaryDirectory() as directory, AgentState.open(Path(directory) / "agent.db") as state:
+            asyncio.run(exercise(state))
 
     def test_ordinary_cadence_survives_restart_and_urgent_human_burst_bypasses_it(self):
         now = time.time()
@@ -109,6 +297,9 @@ class CompanionTests(unittest.TestCase):
                     if path == "memories":
                         return {"memories": []}
                     return {"messages": [row]}
+
+                async def list_tools(self, **params):
+                    return []
 
                 async def post(self, *args, **kwargs):
                     raise AssertionError("Unready or manual Bridge must not receive a submission")
@@ -379,6 +570,483 @@ class CompanionTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_agent_uses_scoped_catalog_for_one_read_then_drafts_quote(self):
+        search = {
+            "name": "search_messages", "description": "Search the configured chat.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"q": {"type": "string", "minLength": 1, "maxLength": 120}},
+                "required": ["q"],
+            },
+        }
+        privileged = [{"name": name, "inputSchema": {"type": "object"}} for name in (
+            "wechat_send_message", "wechat_read_current_chat",
+        )]
+        tools = [*LEGACY_WECHAT_CATALOG, search, *privileged]
+
+        async def exercise(state, read_tool, arguments, *, legacy=False):
+            now = time.time()
+            chat = "合成测试群"
+            trigger = message(1, now, "@阿桥 看看当前会话", author_kind="human")
+            models, bridge_posts = [], []
+            settings = Settings(selective=False)
+            scope = {"scope": "conversation", "chat": chat}
+            local_read = read_tool == "search_messages"
+            matched = message(
+                5, now, "合成实时文本", author_kind="human", media_path="INTERNAL_MEDIA_PATH",
+                metadata={"private": "INTERNAL_METADATA", "capture_quality": "node"},
+            )
+
+            def bridge_handler(request):
+                path = request.url.path
+                if request.method == "POST":
+                    payload = json.loads(request.content)
+                    bridge_posts.append((path, payload))
+                    if path.startswith("/tools/") or path.startswith("/wechat/agent-tools/"):
+                        self.assertEqual(dict(request.url.params), {} if legacy else scope)
+                        text = json.dumps(matched, ensure_ascii=False) if local_read else "合成实时文本"
+                        content = [{"type": "text", "text": text}]
+                        if local_read:
+                            content.extend({"type": "text", "text": json.dumps(row)} for row in (
+                                {**matched, "chat": "不同群"},
+                                {**matched, "author_kind": "unknown", "is_self": True},
+                            ))
+                        return httpx.Response(200, json={
+                            "content": [*content, {"type": "image", "data": "UNFORWARDED_IMAGE"}],
+                            "structuredContent": {"private": "UNFORWARDED_STRUCTURE"},
+                        })
+                    self.assertEqual(path, "/drafts")
+                    return httpx.Response(200, json={"id": 9, "status": "pending"})
+                if path == "/tools":
+                    self.assertEqual(dict(request.url.params), scope)
+                    return httpx.Response(404 if legacy else 200, json={"tools": tools})
+                if path == "/status":
+                    return httpx.Response(200, json={"chat": chat, "source": {"ready": True}, "send_mode": "manual"})
+                if path in {"/messages", "/messages/new"}:
+                    return httpx.Response(200, json={"messages": [trigger]})
+                if path == "/messages/search":
+                    return httpx.Response(200, json={"messages": []})
+                self.assertEqual(path, "/memories")
+                return httpx.Response(200, json={"memories": []})
+
+            def model_handler(request):
+                payload = json.loads(request.content)
+                models.append(payload)
+                names = [tool["function"]["name"] for tool in payload["tools"]]
+                if len(models) == 1:
+                    expected = ["draft_quoted_reply", "get_configured_chat_messages"]
+                    self.assertEqual(names, expected if legacy else [*expected, "search_messages"])
+                    if not legacy:
+                        expected_parameters = {**search["inputSchema"], "additionalProperties": False}
+                        self.assertEqual(payload["tools"][-1]["function"]["parameters"], expected_parameters)
+                    tool, call_id, args = read_tool, "call_read", arguments
+                else:
+                    self.assertEqual(names, ["draft_quoted_reply"])
+                    prior, result = payload["messages"][-2:]
+                    self.assertEqual(prior["role"], "assistant")
+                    self.assertEqual(prior["tool_calls"][0]["id"], "call_read")
+                    self.assertEqual(prior["reasoning_content"], "synthetic provider continuation")
+                    self.assertEqual(result["role"], "tool")
+                    self.assertEqual(result["tool_call_id"], "call_read")
+                    text, = json.loads(result["content"])["content"]
+                    self.assertEqual(text["type"], "text")
+                    if local_read:
+                        data = json.loads(text["text"])
+                        self.assertEqual((data["text"], data["speaker_role"]), ("合成实时文本", "human_peer"))
+                        self.assertEqual(data["capture_quality"], "node")
+                        self.assertNotIn("INTERNAL", text["text"])
+                    else:
+                        self.assertEqual(text["text"], "合成实时文本")
+                    tool, call_id = "draft_quoted_reply", "call_quote"
+                    args = {"reply": "我看到这条了。", "quote_message_id": trigger["id"]}
+                return httpx.Response(200, json={"choices": [{"finish_reason": "tool_calls", "message": {
+                    "reasoning_content": "synthetic provider continuation",
+                    "tool_calls": [{"type": "function", "id": call_id, "function": {
+                        "name": tool, "arguments": json.dumps(args),
+                    }}],
+                }}]})
+
+            state.bind_chat(chat, 0)
+            async with httpx.AsyncClient(
+                base_url="http://bridge.test/", transport=httpx.MockTransport(bridge_handler),
+            ) as bridge_http, httpx.AsyncClient(
+                base_url="http://model.test/", transport=httpx.MockTransport(model_handler),
+            ) as model_http:
+                model = ModelClient(model_http, "synthetic-model", "合成测试人格", quote_tool=True)
+                companion = Companion(settings, BridgeClient(bridge_http), model, state)
+                companion.chat = chat
+                await companion.poll_once(now)
+                await companion.respond_once(now)
+                await companion.respond_once(now)
+
+            self.assertEqual(len(models), 2)
+            expected_read = (
+                ("/wechat/agent-tools/wechat_read_current_chat", {"chat": chat, "arguments": arguments})
+                if legacy else (f"/tools/{read_tool}", arguments)
+            )
+            self.assertEqual(bridge_posts, [
+                expected_read,
+                ("/drafts", {
+                    "chat": chat, "author_kind": "llm", "text": "我看到这条了。", "auto_send": False,
+                    "request_id": Job(trigger, "mention", now + 60, None).request_id("draft"), "quote_message_id": 1,
+                }),
+            ])
+            self.assertIsNone(state.next_job(now))
+
+        for name, arguments, legacy in (
+            ("get_configured_chat_messages", {"limit": 6}, False),
+            ("search_messages", {"q": "合成关键词"}, False),
+            ("get_configured_chat_messages", {"limit": 6}, True),
+        ):
+            with self.subTest(name=name, legacy=legacy):
+                with TemporaryDirectory() as directory, AgentState.open(Path(directory) / "agent.db") as state:
+                    asyncio.run(exercise(state, name, arguments, legacy=legacy))
+
+    def test_trusted_bridge_calls_use_the_complete_catalog_without_conversation_scope(self):
+        async def exercise():
+            native = {"name": "wechat_screenshot", "inputSchema": {"type": "object"}}
+            calls = []
+
+            def bridge_handler(request):
+                self.assertEqual(request.headers["Authorization"], "Bearer bridge-test-only")
+                self.assertEqual(dict(request.url.params), {})
+                if request.method == "GET":
+                    self.assertEqual(request.url.path, "/tools")
+                    return httpx.Response(200, json={"tools": [native]})
+                self.assertEqual(request.url.path, "/tools/wechat_screenshot")
+                calls.append(json.loads(request.content))
+                return httpx.Response(200, json={"content": [{"type": "image", "data": "synthetic"}]})
+
+            async with httpx.AsyncClient(
+                base_url="http://bridge.test/", headers={"Authorization": "Bearer bridge-test-only"},
+                transport=httpx.MockTransport(bridge_handler),
+            ) as http:
+                bridge = BridgeClient(http)
+                self.assertEqual(await bridge.list_tools(), [native])
+                self.assertEqual(await bridge.call_tool("wechat_screenshot", {"scale": 0.25}), {
+                    "content": [{"type": "image", "data": "synthetic"}],
+                })
+                with self.assertRaisesRegex(ValueError, "Invalid Bridge tool name"):
+                    await bridge.call_tool("../drafts", {})
+            self.assertEqual(calls, [{"scale": 0.25}])
+
+        asyncio.run(exercise())
+
+    def test_native_wechat_rejects_other_tools_and_never_calls_twice(self):
+        async def exercise():
+            now = time.time()
+            row = message(1, now, "合成测试文本", author_kind="human")
+            job = Job(row, "selective", now + 60, None)
+
+            def call(name="get_configured_chat_messages", arguments="{}", id="call_1"):
+                return {"id": id, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+            failures = [
+                [call("wechat_send_message")],
+                [call("wechat_read_current_chat")],
+                [call("search_messages", arguments='{"q":"not offered"}')],
+                [call(arguments='{"chat":"other"}')],
+                [call(arguments='{"limit":21}')],
+                [call(arguments='{"limit":true}')],
+                [call(id="invalid call")],
+                [call(), call()],
+            ]
+            for calls in failures:
+                with self.subTest(calls=calls):
+                    requests = []
+
+                    async def forbidden(*_):
+                        self.fail("Invalid native tool invocation executed")
+
+                    def model_handler(request):
+                        requests.append(json.loads(request.content))
+                        return httpx.Response(200, json={"choices": [{"message": {"tool_calls": calls}}]})
+
+                    async with httpx.AsyncClient(
+                        base_url="http://model.test/", transport=httpx.MockTransport(model_handler),
+                    ) as http:
+                        model = ModelClient(http, "synthetic", "合成人格")
+                        self.assertEqual(await model.decide(job, [row], [], [], [], tool_catalog=LEGACY_WECHAT_CATALOG, call_tool=forbidden), Decision())
+                    self.assertEqual(len(requests), 1)
+
+            reads, requests = [], []
+
+            async def read(name, arguments):
+                reads.append((name, arguments))
+                return {"content": [{"type": "text", "text": "合成可读文本"}]}
+
+            def model_keeps_calling(request):
+                requests.append(json.loads(request.content))
+                return httpx.Response(200, json={"choices": [{"message": {"tool_calls": [call()]}}]})
+
+            async with httpx.AsyncClient(
+                base_url="http://model.test/", transport=httpx.MockTransport(model_keeps_calling),
+            ) as http:
+                model = ModelClient(http, "synthetic", "合成人格")
+                self.assertEqual(await model.decide(job, [row], [], [], [], tool_catalog=LEGACY_WECHAT_CATALOG, call_tool=read), Decision())
+            self.assertEqual(reads, [("get_configured_chat_messages", {"limit": 20})])
+            self.assertEqual(len(requests), 2)
+            self.assertNotIn("tools", requests[1])
+
+            reads.clear()
+            requests.clear()
+            outputs = iter((
+                {"tool_calls": [call()]},
+                {"content": "未采用结构化回复"},
+                {"content": "我看到本群最新消息了。"},
+            ))
+
+            def model_needs_plain_retry(request):
+                requests.append(json.loads(request.content))
+                return httpx.Response(200, json={"choices": [{"message": next(outputs)}]})
+
+            async with httpx.AsyncClient(
+                base_url="http://model.test/", transport=httpx.MockTransport(model_needs_plain_retry),
+            ) as http:
+                model = ModelClient(http, "synthetic", "合成人格")
+                self.assertEqual(
+                    await model.decide(replace(job, reason="mention"), [row], [], [], [], tool_catalog=LEGACY_WECHAT_CATALOG, call_tool=read),
+                    Decision("我看到本群最新消息了。"),
+                )
+            self.assertEqual(len(reads), 1)
+            self.assertEqual(len(requests), 3)
+            self.assertNotIn("tools", requests[2])
+            retry_content = json.loads(requests[2]["messages"][1]["content"])
+            self.assertEqual(retry_content["native_wechat_read"], {
+                "content": [{"type": "text", "text": "合成可读文本"}],
+            })
+
+        asyncio.run(exercise())
+
+    def test_explicit_tool_capability_rejection_retries_structured_once(self):
+        async def exercise(code, metadata, retry_expected):
+            now = time.time()
+            row = message(1, now, "测试兼容模型", author_kind="human")
+            requests = []
+
+            async def not_called(*_):
+                self.fail("A rejected tools request must never invoke a Bridge tool")
+
+            def handler(request):
+                payload = json.loads(request.content)
+                requests.append(payload)
+                if len(requests) == 1:
+                    names = {tool["function"]["name"] for tool in payload["tools"]}
+                    self.assertEqual(names, {"draft_quoted_reply", "get_configured_chat_messages"})
+                    return httpx.Response(code, json={"error": metadata})
+                self.assertNotIn("tools", payload)
+                self.assertNotIn("tool_choice", payload)
+                self.assertNotIn("available read tools", payload["messages"][0]["content"])
+                self.assertEqual(payload["messages"][1], requests[0]["messages"][1])
+                content = '{"reply":"兼容普通回复","quote_message_id":1}'
+                return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+            async with httpx.AsyncClient(
+                base_url="http://model.test/", transport=httpx.MockTransport(handler),
+            ) as http:
+                model = ModelClient(http, "synthetic", "合成人格", quote_tool=True)
+
+                async def decide():
+                    return await model.decide(
+                        Job(row, "selective", now + 60, None), [row], [], [], [],
+                        tool_catalog=LEGACY_WECHAT_CATALOG, call_tool=not_called,
+                    )
+
+                if retry_expected:
+                    self.assertEqual(await decide(), Decision("兼容普通回复", quote_message_id=1))
+                else:
+                    with self.assertRaises(httpx.HTTPStatusError):
+                        await decide()
+            self.assertEqual(len(requests), 2 if retry_expected else 1)
+
+        for code, metadata, retry in (
+            (400, {"message": "This model does not support function calling"}, True),
+            (422, {"code": "tools_not_supported"}, True),
+            (400, {"message": "Invalid tool choice format"}, False),
+            (403, {"code": "tools_not_supported"}, False),
+        ):
+            with self.subTest(code=code, metadata=metadata):
+                asyncio.run(exercise(code, metadata, retry))
+
+    def test_agent_rechecks_chat_before_scoped_call_and_drops_results_after_scope_changes(self):
+        async def exercise():
+            chat = "合成测试群"
+            actual_chat = "不同群"
+            requests = []
+
+            def handler(request):
+                requests.append(request.url.path)
+                if request.url.path == "/status":
+                    return httpx.Response(200, json={"chat": actual_chat, "source": {"ready": True}})
+                self.assertEqual(request.url.path, "/tools/get_configured_chat_messages")
+                companion.scope += 1
+                return httpx.Response(200, json={"content": [{"type": "text", "text": "DISCARDED"}]})
+
+            async with httpx.AsyncClient(
+                base_url="http://bridge.test/", transport=httpx.MockTransport(handler),
+            ) as http:
+                companion = Companion(Settings(), BridgeClient(http), object(), object())
+                companion.chat = chat
+                result = await companion.read_conversation_tool(
+                    chat, companion.scope, "get_configured_chat_messages", {}, legacy=False,
+                )
+                self.assertEqual(result, {"isError": True})
+                self.assertEqual(requests, ["/status"])
+
+                actual_chat = chat
+                result = await companion.read_conversation_tool(
+                    chat, companion.scope, "get_configured_chat_messages", {}, legacy=False,
+                )
+                self.assertEqual(result, {"isError": True})
+                self.assertEqual(requests, ["/status", "/status", "/tools/get_configured_chat_messages"])
+
+        asyncio.run(exercise())
+
+    def test_final_reply_rejects_internal_markers_in_json_tool_and_plain_formats(self):
+        for bad_text in (
+            "<think>synthetic internal reasoning</think>",
+            "推理过程：合成文本",
+            '{"reply":"nested protocol"}',
+        ):
+            with self.subTest(bad_text=bad_text):
+                payload = {"reply": bad_text, "quote_message_id": 3}
+                arguments = json.dumps(payload)
+                tool_call = [{"type": "function", "function": {
+                    "name": "draft_quoted_reply", "arguments": arguments,
+                }}]
+                self.assertEqual(parse_decision(arguments), Decision())
+                self.assertEqual(quote_tool_decision(tool_call), Decision())
+                self.assertEqual(parse_plain_reply(arguments), Decision())
+        self.assertEqual(parse_plain_reply("在，怎么了？"), Decision("在，怎么了？"))
+
+    def test_legacy_saved_reply_with_internal_markers_does_not_replay(self):
+        now = time.time()
+        chat = "合成测试群"
+        settings = Settings()
+        trigger = message(1, now, "@阿桥 看到了吗", author_kind="human")
+
+        with TemporaryDirectory() as directory, AgentState.open(Path(directory) / "agent.db") as state:
+            state.bind_chat(chat, 0)
+            state.collect([trigger], chat, settings, now)
+            job = state.next_job(now)
+            state.prepare(job, Decision("<think>legacy internal text</think>"))
+            companion = Companion(settings, object(), object(), state)
+            companion.chat, companion.ready = chat, True
+
+            asyncio.run(companion.respond_once(now))
+
+            self.assertEqual(state.get("cursor"), 1)
+            self.assertIsNone(state.next_job(now))
+
+    def test_required_trigger_has_full_body_and_quote_when_recent_context_clips_it(self):
+        async def exercise():
+            now = time.time()
+            quote = {"text": "原来的 Agent 回复", "author_label": "本账号", "author_kind": "llm", "message_id": 1}
+            body = "这是我的新回复。真正想问的是应该怎么做？"
+            trigger = message(
+                2, now, body + "\n\n本账号：原来的 Agent 回复", is_self=True, author_kind="human",
+                reply_text=body, quote=quote,
+            )
+            recent = [trigger, *[
+                message(id, now, "甲" * size, author_kind="human") for id, size in ((3, 676), (4, 1600), (5, 1600))
+            ]]
+            prompts = []
+
+            def model_handler(request):
+                prompts.append(json.loads(json.loads(request.content)["messages"][1]["content"]))
+                return httpx.Response(200, json={"choices": [{"message": {"content": '{"reply":"合成回复"}'}}]})
+
+            async with httpx.AsyncClient(
+                base_url="http://model.test/", transport=httpx.MockTransport(model_handler),
+            ) as http:
+                model = ModelClient(http, "synthetic-model", "合成测试人格")
+                job = Job(trigger, "agent-quote", now + 60, None)
+                await model.decide(job, recent, [], [], [])
+                await model.decide(job, [trigger], [], [], [])
+
+            pressured, ordinary_room = prompts
+            clipped = next(row for row in pressured["recent"] if row["id"] == trigger["id"])
+            self.assertLess(len(clipped["text"]), len(body))
+            self.assertNotIn("quote", clipped)
+            self.assertEqual(pressured["trigger"]["id"], trigger["id"])
+            self.assertEqual(pressured["trigger"]["text"], body)
+            self.assertEqual(pressured["trigger"]["quote"], quote)
+            self.assertNotIn("trigger", ordinary_room)
+            self.assertEqual(ordinary_room["recent"][0]["text"], body)
+            self.assertEqual(ordinary_room["recent"][0]["quote"], quote)
+
+        asyncio.run(exercise())
+
+    def test_verified_urgent_survives_failed_optional_search_memory_and_media(self):
+        async def exercise(state):
+            now = time.time()
+            chat = "合成测试群"
+            trigger = message(2, now, "@阿桥 这条需要回应", author_kind="human")
+            photo = message(1, now, None, type="image", media_path="synthetic.png")
+            rows = [photo, trigger]
+            drafts = []
+            optional_requests = []
+            prompts = []
+
+            def bridge_handler(request):
+                path = request.url.path
+                if request.method == "POST":
+                    self.assertEqual(path, "/drafts")
+                    drafts.append(json.loads(request.content))
+                    return httpx.Response(200, json={"id": 8, "status": "sent"})
+                if path == "/status":
+                    return httpx.Response(200, json={"chat": chat, "source": {"ready": True}, "send_mode": "auto"})
+                if path == "/messages/new":
+                    after_id = int(request.url.params["after_id"])
+                    limit = int(request.url.params["limit"])
+                    return httpx.Response(200, json={"messages": [row for row in rows if row["id"] > after_id][:limit]})
+                if path == "/messages":
+                    return httpx.Response(200, json={"messages": rows})
+                optional_requests.append(path)
+                if path == "/tools":
+                    return httpx.Response(503, json={"detail": "synthetic catalog unavailable"})
+                if path == "/messages/search":
+                    raise httpx.ReadTimeout("synthetic optional search failure", request=request)
+                if path == "/memories":
+                    return httpx.Response(200, json={"memories": [{"text": 100}]})
+                self.assertEqual(path, "/media/1")
+                return httpx.Response(502, json={"detail": "synthetic optional media failure"})
+
+            def model_handler(request):
+                payload = json.loads(request.content)
+                self.assertNotIn("tools", payload)
+                content = payload["messages"][1]["content"]
+                self.assertIsInstance(content, str)
+                prompts.append(json.loads(content))
+                return httpx.Response(200, json={"choices": [{"message": {"content": '{"reply":"我来回答。"}'}}]})
+
+            settings = Settings(auto_send=True, multimodal=True, selective=False)
+            state.bind_chat(chat, 0)
+            async with httpx.AsyncClient(
+                base_url="http://bridge.test/", transport=httpx.MockTransport(bridge_handler),
+            ) as bridge_http, httpx.AsyncClient(
+                base_url="http://model.test/", transport=httpx.MockTransport(model_handler),
+            ) as model_http:
+                model = ModelClient(model_http, "synthetic-model", "合成测试人格")
+                companion = Companion(settings, BridgeClient(bridge_http), model, state)
+                companion.chat = chat
+                await companion.poll_once(now)
+                await companion.respond_once(now)
+                await companion.respond_once(now)
+            self.assertCountEqual(optional_requests, ["/messages/search", "/memories", "/media/1", "/tools"])
+            prompt, = prompts
+            self.assertEqual(prompt["history"], [])
+            self.assertEqual(prompt["memories"], [])
+            self.assertEqual(prompt["trigger_id"], trigger["id"])
+            draft, = drafts
+            self.assertEqual(draft["text"], "我来回答。")
+            self.assertTrue(draft["auto_send"])
+            self.assertEqual(draft["request_id"], Job(trigger, "mention", now + 60, None).request_id("draft"))
+            self.assertIsNone(state.next_job(now))
+
+        with TemporaryDirectory() as directory, AgentState.open(Path(directory) / "agent.db") as state:
+            asyncio.run(exercise(state))
+
     def test_urgent_only_model_fallback_retries_once_as_plain_text(self):
         async def exercise():
             now = time.time()
@@ -502,6 +1170,8 @@ class CompanionTests(unittest.TestCase):
                     return httpx.Response(200, json={"messages": rows})
                 if path == "/messages/search":
                     return httpx.Response(200, json={"messages": []})
+                if path == "/tools":
+                    return httpx.Response(200, json={"tools": []})
                 self.assertEqual(path, "/memories")
                 return httpx.Response(200, json={"memories": []})
 
@@ -755,6 +1425,9 @@ class CompanionTests(unittest.TestCase):
                         return {"messages": [row for row in self.rows if row["id"] > params["after_id"]]}
                     return {"messages": self.rows}
 
+                async def list_tools(self, **params):
+                    return []
+
                 async def post(self, path, **kwargs):
                     self.posts.append((path, kwargs))
                     return {"id": 1, "status": "pending"}
@@ -832,6 +1505,8 @@ class CompanionTests(unittest.TestCase):
             if path == "/messages/search":
                 self.assertNotIn("for_model", request.url.params)
                 return httpx.Response(200, json={"messages": [earlier]})
+            if path == "/tools":
+                return httpx.Response(200, json={"tools": []})
             if path == "/memories" and request.method == "GET":
                 return httpx.Response(200, json={"memories": [{"kind": "summary", "text": "记忆合成数据"}]})
             if path == "/media/12":
@@ -939,6 +1614,25 @@ async def test_bridge_agent_attaches_scoped_png_and_prepares_manual_draft(tmp_pa
         payload = json.loads(request.content)
         model_requests.append(payload)
         context = json.loads(payload["messages"][1]["content"][0]["text"])
+        if len(model_requests) == 1:
+            functions = {tool["function"]["name"] for tool in payload["tools"]}
+            assert functions == {
+                "get_configured_chat_messages", "get_message", "get_recent_messages",
+                "get_new_messages", "search_messages", "search_memories",
+            }
+            call = {"id": "integration_lookup", "type": "function", "function": {
+                "name": "get_message",
+                "arguments": json.dumps({"message_id": context["trigger_id"]}),
+            }}
+            return httpx.Response(200, json={"choices": [{"message": {"tool_calls": [call]}}]})
+        assert "tools" not in payload
+        assistant, tool = payload["messages"][-2:]
+        assert assistant["tool_calls"][0]["id"] == tool["tool_call_id"] == "integration_lookup"
+        item, = json.loads(tool["content"])["content"]
+        record = json.loads(item["text"])
+        assert record["speaker_role"] == "human_same_account"
+        assert record["id"] == context["trigger_id"]
+        assert "metadata" not in record
         decision = json.dumps({
             "reply": "收到了，第二行保留。\n🙂", "memory": None, "quote_message_id": context["trigger_id"],
         }, ensure_ascii=False)
@@ -990,7 +1684,8 @@ async def test_bridge_agent_attaches_scoped_png_and_prepares_manual_draft(tmp_pa
         assert draft["author_kind"] == "llm"
         assert sender.calls == 0
 
-    request, = model_requests
+    request, follow_up = model_requests
+    assert follow_up["messages"][0:2] == request["messages"]
     content = request["messages"][1]["content"]
     prompt = json.loads(content[0]["text"])
     observed_media, observed_trigger = prompt["recent"]

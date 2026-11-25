@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from PIL import Image, ImageDraw
 
-from bridge.accessibility import AccessibilitySource
+from bridge.accessibility import AccessibilitySource, _same_visible_crop
 from bridge.models import Message, message_key
 from bridge.wechat_layout import RowLayout, analyze_message_row, image_preview_box
 
@@ -44,6 +44,39 @@ def test_image_crop_excludes_both_avatar_and_nickname():
     assert row.crop(layout.media_box).size == (166, 112)
 
 
+def test_sticker_can_use_a_visible_bounded_crop_without_opening_a_viewer():
+    row = Image.new("RGB", (578, 156), "#fafafa")
+    paint(row, (20, 8, 56, 44), "#84726d")
+    paint(row, (69, 32, 140, 110), "#efd0f0")
+    layout = analyze_message_row(row, "sticker")
+    assert layout.media_box == (69, 32, 140, 110)
+    sparse = Image.new("RGB", (578, 156), "#fafafa")
+    paint(sparse, (20, 8, 56, 44), "#84726d")
+    paint(sparse, (69, 50, 85, 70), "#efd0f0")
+    assert analyze_message_row(sparse, "sticker").media_box is None
+
+
+def test_pre_click_check_requires_unchanged_exact_pixels_and_bounds(monkeypatch):
+    original = Image.new("RGB", (36, 36), "#663366")
+    row = (80, 100, 578, 75)
+    box = (20, 8, 56, 44)
+    window = (0, 0, 880, 640)
+    expected_bounds = (100, 108, 36, 36)
+
+    def stable(bounds, window_bounds, pid):
+        assert (bounds, window_bounds, pid) == (expected_bounds, window, 42)
+        return original.copy(), bounds
+
+    monkeypatch.setattr("bridge.accessibility._capture_pixels", stable)
+    assert _same_visible_crop(row, box, original, window, 42)
+    changed = original.copy()
+    changed.putpixel((7, 7), (0, 0, 0))
+    monkeypatch.setattr("bridge.accessibility._capture_pixels", lambda *args: (changed, expected_bounds))
+    assert not _same_visible_crop(row, box, original, window, 42)
+    monkeypatch.setattr("bridge.accessibility._capture_pixels", lambda *args: (original, (100, 108, 25, 36)))
+    assert not _same_visible_crop(row, box, original, window, 42)
+
+
 def test_native_click_can_use_visible_interior_of_a_photo_touching_name_cutoff():
     row = Image.new("RGB", (578, 156), "#fafafa")
     paint(row, (20, 8, 56, 44), "#84726d")
@@ -74,6 +107,28 @@ def test_photo_enrichment_falls_back_to_bubble_when_native_viewer_is_unverified(
         assert enriched.metadata["capture_quality"] == quality
         with Image.open(tmp_path / enriched.media_path) as stored:
             assert stored.size == size
+
+
+def test_generic_fallback_does_not_save_the_full_width_of_a_message_panel(monkeypatch, tmp_path):
+    source = AccessibilitySource("fixture", media_dir=tmp_path, profile={
+        "package_version": "fixture", "window": {"role": "frame"}, "chat_header": {"role": "label"},
+        "message_list": {"role": "list"}, "message_row": {"role": "list item"}, "input": {"role": "text"},
+    })
+    panel = SimpleNamespace(bounds=(100, 50, 578, 156))
+    chat = SimpleNamespace(pid=42, panel=panel, window=SimpleNamespace(bounds=(0, 0, 880, 640)))
+    row = SimpleNamespace(native=object(), bounds=(100, 50, 578, 120))
+    original = Message(chat="fixture", type="image")
+
+    captures = []
+
+    def capture(*args):
+        captures.append(args)
+        return None
+
+    monkeypatch.setattr("bridge.accessibility._capture_pixels", capture)
+    assert source._with_media([(row, original, row)], chat) == (original,)
+    assert captures == []
+    assert not list(tmp_path.iterdir())
 
 
 def test_layout_rejects_no_avatar_both_avatars_and_unknown_background():

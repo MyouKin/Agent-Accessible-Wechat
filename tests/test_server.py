@@ -1,3 +1,4 @@
+import httpx
 from fastapi.testclient import TestClient
 
 from bridge.config import Settings
@@ -5,6 +6,7 @@ from bridge.desktop import SendResult
 from bridge.models import Message, message_key
 from bridge.server import create_app
 from bridge.storage import Store
+from bridge.wechat_tools import read_attached_chat
 
 from test_sync import SyntheticSource, snapshot
 
@@ -73,7 +75,7 @@ def test_idempotent_auto_and_memory(tmp_path):
         assert not client.get("/memories?q=夜", headers=AUTH).json()["memories"]
 
 
-def test_mcp_tools_with_separate_read_draft_token(tmp_path):
+def test_mcp_uses_protocol_token_and_preserves_draft_confirmation(tmp_path):
     client, sender = create_client(tmp_path, mcp=True, send_mode="auto")
     with client:
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
@@ -82,7 +84,8 @@ def test_mcp_tools_with_separate_read_draft_token(tmp_path):
         assert response.status_code == 200
         assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
             "get_status", "get_recent_messages", "get_new_messages", "search_messages",
-            "get_media", "draft_message",
+            "get_media", "draft_message", "wait_for_messages", "get_message", "list_drafts",
+            "get_draft_status", "search_memories", "get_sync_gaps", "get_configured_chat_messages",
         }
         request["method"] = "tools/call"
         request["params"] = {
@@ -93,8 +96,73 @@ def test_mcp_tools_with_separate_read_draft_token(tmp_path):
         assert response.status_code == 200
         assert response.json()["result"]["structuredContent"]["status"] == "pending"
         assert response.json()["result"]["structuredContent"]["quote_message_id"] == 2
+        request["params"] = {"name": "get_draft_status", "arguments": {"draft_id": 1}}
+        status = client.post("/mcp", json=request, headers=MCP_AUTH).json()["result"]["structuredContent"]
+        assert status["status"] == "pending" and status["quote_message_id"] == 2
+        assert "submission_anchors" not in status
         assert client.post("/drafts/1/confirm", headers=MCP_AUTH).status_code == 401
         assert not sender.calls
+
+
+def test_history_helpers_only_return_the_configured_chat(tmp_path):
+    for chat, text in (("other", "outside target"), ("test", "selected")):
+        store = Store(tmp_path, chat)
+        store.save_sync("tracking", messages=(Message(chat=chat, text=text),), gap=f"{chat} gap")
+        store.close()
+    client, _ = create_client(tmp_path)
+    with client:
+        assert client.get("/messages/1", headers=AUTH).status_code == 404
+        assert client.get("/messages/2", headers=AUTH).json()["text"] == "selected"
+        assert [row["id"] for row in client.get("/messages/wait?after_id=0&timeout=0", headers=AUTH).json()["messages"]] == [2]
+        assert client.get("/messages/wait?after_id=2&timeout=0", headers=AUTH).json() == {"messages": []}
+        assert client.get("/messages/wait?timeout=31", headers=AUTH).status_code == 422
+        assert [row["reason"] for row in client.get("/sync/gaps", headers=AUTH).json()["gaps"]] == ["test gap"]
+
+
+def test_agent_live_tool_is_authenticated_bounded_and_scoped(tmp_path):
+    import json
+
+    client, sender = create_client(tmp_path, mcp=True)
+    path = "/tools/get_configured_chat_messages"
+    scope = {"scope": "conversation", "chat": "test"}
+    with client:
+        assert client.post(path, params=scope, json={"limit": 1}, headers=MCP_AUTH).status_code == 401
+        wrong_chat = {**scope, "chat": "another group"}
+        assert client.post(path, params=wrong_chat, json={"limit": 1}, headers=AUTH).status_code == 409
+        for invalid in ({"limit": 21}, {"chat": "injected"}, {"arguments": {"limit": 1}}):
+            denied = client.post(path, params=scope, json=invalid, headers=AUTH)
+            assert denied.status_code == 200 and denied.json()["isError"] is True
+        response = client.post(path, params=scope, json={"limit": 1}, headers=AUTH)
+        assert response.status_code == 200
+        data = json.loads(response.json()["content"][0]["text"])
+        assert data["chat"] == "test" and data["source"] == "accessibility"
+        assert [row["text"] for row in data["messages"]] == ["C"]
+        denied = client.post("/tools/wechat_broadcast", params=scope, json={}, headers=AUTH)
+        assert denied.status_code == 200 and denied.json()["isError"] is True
+        legacy = client.post("/wechat/agent-tools/wechat_read_current_chat",
+                             json={"chat": "test", "arguments": {"limit": 1}}, headers=AUTH)
+        assert legacy.status_code == 200
+        assert json.loads(legacy.json()["content"][0]["text"]) == data
+        assert not sender.calls
+
+
+async def test_attached_driver_result_must_match_scope_and_limit():
+    import json
+
+    def handler(request):
+        assert request.headers["Authorization"] == f"Bearer {MCP_TOKEN}"
+        arguments = json.loads(request.content)
+        assert arguments == {"chat": "test", "limit": 1}
+        return httpx.Response(200, json=result)
+
+    async with httpx.AsyncClient(base_url="http://127.0.0.1", transport=httpx.MockTransport(handler)) as client:
+        result = {"chat": "test", "source": "wechat_mcp", "messages": [{"text": "observed"}]}
+        assert await read_attached_chat(client, MCP_TOKEN, "test", 1) == result
+        result["chat"] = "other chat"
+        assert await read_attached_chat(client, MCP_TOKEN, "test", 1) is None
+        result["chat"] = "test"
+        result["messages"] *= 2
+        assert await read_attached_chat(client, MCP_TOKEN, "test", 1) is None
 
 
 def test_quote_confirm_passes_stored_sequence_and_keeps_draft_idempotent(tmp_path):

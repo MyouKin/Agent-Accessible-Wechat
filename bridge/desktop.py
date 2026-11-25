@@ -86,6 +86,7 @@ class Target(Protocol):
     pid: int
     window_bounds: tuple[int, int, int, int]
     input_bounds: tuple[int, int, int, int]
+    chat: str
 
 
 class SendSource(Protocol):
@@ -172,9 +173,13 @@ class MessageSender:
         self.lock = lock
         self.send_key = send_key
 
+    def set_target(self, chat: str) -> None:
+        """Rebind under the Bridge operation lock."""
+        self.chat = chat
+
     async def active_target(self) -> str:
         target = await self.source.get_target()
-        if target is None or not self.chat:
+        if target is None or not self.chat or target.chat != self.chat:
             raise DesktopError("The target chat and its input could not be verified")
         window = await command("xdotool", "getactivewindow")
         pid = await command("xdotool", "getwindowpid", window)

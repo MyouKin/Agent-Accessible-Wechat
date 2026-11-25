@@ -50,7 +50,41 @@ ENV HOME=/home/wechat \
     LIBGL_ALWAYS_SOFTWARE=1 \
     PYTHONUNBUFFERED=1
 
-FROM desktop AS bridge
+FROM desktop AS desktop-tools
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       imagemagick locales procps python3-pyatspi \
+    && localedef -i zh_CN -f UTF-8 zh_CN.UTF-8 \
+    && rm -rf /var/lib/apt/lists/* \
+    && install -d -o wechat -g wechat -m 0700 /wechat-tools
+
+FROM desktop-tools AS operator
+WORKDIR /opt/operator
+
+RUN python3 -m venv --system-site-packages /opt/operator-venv
+ENV VIRTUAL_ENV=/opt/operator-venv
+ENV PATH="/opt/operator-venv/bin:${PATH}"
+
+COPY docker/operator/requirements.lock /opt/operator/requirements.lock
+RUN --mount=type=bind,from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    UV_CACHE_DIR=/root/.cache/uv UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy \
+    uv pip sync --require-hashes /opt/operator/requirements.lock
+
+# Bundle the pinned MIT-licensed upstream package and retain its license.
+RUN set -eu; \
+    revision=1a559f614c43e28abb2ec9936a5ad39579312916; \
+    curl --fail --show-error --silent --location --proto '=https' --retry 3 \
+      --output /tmp/wechat-mcp.tar.gz \
+      "https://codeload.github.com/zongwei-tang/wechat-mcp/tar.gz/$revision"; \
+    echo "a43600eeca13dcb52ad2379bb09bf8b12199fabd21f222e0ac1c5514bfce6e06  /tmp/wechat-mcp.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/wechat-mcp.tar.gz --strip-components=1 \
+      "wechat-mcp-$revision/wechat_mcp" "wechat-mcp-$revision/LICENSE"; \
+    rm /tmp/wechat-mcp.tar.gz
+
+COPY docker/operator/bridge_operator.py docker/operator/wechat_sessions.py /opt/operator/
+FROM desktop-tools AS bridge
 WORKDIR /app
 
 RUN python3 -m venv --system-site-packages /opt/bridge
@@ -60,12 +94,15 @@ ENV PATH="/opt/bridge/bin:${PATH}"
 COPY pyproject.toml uv.lock /app/
 RUN --mount=type=bind,from=uv,source=/uv,target=/usr/local/bin/uv \
     --mount=type=cache,target=/root/.cache/uv \
-    UV_PROJECT_ENVIRONMENT="$VIRTUAL_ENV" UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT="$VIRTUAL_ENV" UV_CACHE_DIR=/root/.cache/uv \
+    UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy \
     uv sync --locked --no-dev --extra mcp --no-install-project --python /usr/bin/python3
 
 COPY bridge /app/bridge
 COPY tools /app/tools
 COPY config.yaml /app/config.yaml
+COPY --from=operator /opt/operator-venv /opt/operator-venv
+COPY --from=operator /opt/operator /opt/operator
 
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/bridge-entrypoint
 

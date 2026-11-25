@@ -12,6 +12,9 @@ services:
       BRIDGE_TOKEN: ${BRIDGE_TOKEN:?Set BRIDGE_TOKEN in .env}
       MCP_TOKEN: ${MCP_TOKEN:-}
       VNC_PASSWORD: ${VNC_PASSWORD:?Set VNC_PASSWORD in .env}
+      WECHAT_TOOLS_ENABLED: ${WECHAT_TOOLS_ENABLED:-true}
+      WECHAT_TOOLS_PUBLIC_URL: http://127.0.0.1:${BRIDGE_PORT:-8765}
+      WECHAT_TOOLS_AUTO_LOGIN: ${WECHAT_TOOLS_AUTO_LOGIN:-false}
       BRIDGE_CONFIG: /app/config.yaml
       BRIDGE_HOST: 0.0.0.0
       BRIDGE_PORT: 8765
@@ -22,6 +25,7 @@ services:
     volumes:
       - wechat-home:/home/wechat
       - bridge-data:/data
+      - wechat-tools-data:/wechat-tools
       - type: bind
         source: ${BRIDGE_CONFIG_FILE:-./config.yaml}
         target: /app/config.yaml
@@ -46,3 +50,4 @@ services:
 volumes:
   wechat-home:
   bridge-data:
+  wechat-tools-data:

@@ -95,12 +95,13 @@ def _text_mask(image: Image.Image) -> list[Image.Image]:
 def _bubble(row: Image.Image, is_self: bool, kind: str, *, allow_cutoff: bool = False) -> Box | None:
     width, height = row.size
     left_edge, right_edge = 62, width - 64
-    top_edge = 5 if is_self else 28 if kind == "image" else 24
+    media = kind in {"image", "sticker"}
+    top_edge = 5 if is_self else 28 if media else 24
     content = row.crop((left_edge, top_edge, right_edge, height - 4))
     if kind == "text":
         masks = _text_mask(content)
         minimum_width, minimum_height = 24, 23
-    elif kind == "image":
+    elif media:
         masks = [_contrast(content, _BACKGROUND).point(lambda value: 255 if value > 9 else 0)]
         minimum_width, minimum_height = 42, 45
     else:
@@ -116,7 +117,7 @@ def _bubble(row: Image.Image, is_self: bool, kind: str, *, allow_cutoff: bool = 
             continue
         # A rectangle touching the edge of the search area may be clipped or include another control.
         if (left == 0 or right == content.width or bottom == content.height
-                or (kind == "image" and top == 0 and not allow_cutoff)):
+                or (media and top == 0 and not allow_cutoff)):
             continue
         results.add((left + left_edge, top + top_edge, right + left_edge, bottom + top_edge))
     return next(iter(results)) if len(results) == 1 else None
@@ -154,4 +155,4 @@ def analyze_message_row(row: Image.Image, kind: str) -> RowLayout:
         return RowLayout()
     bubble = _bubble(row, is_self, kind)
     return RowLayout(is_self=is_self, avatar_box=avatar, bubble_box=bubble,
-                     media_box=bubble if kind == "image" else None)
+                     media_box=bubble if kind in {"image", "sticker"} else None)

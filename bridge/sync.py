@@ -3,6 +3,7 @@ import json
 import logging
 from dataclasses import dataclass, replace
 
+from .desktop_gate import AsyncDesktopGate
 from .models import Message, Snapshot, SnapshotSource, message_key
 from .storage import Store
 
@@ -47,7 +48,33 @@ class Synchronizer:
         self.poll_interval = poll_interval
         self.anchors = store.anchors()
         self.state: str | None = None
-        self.operation_lock = asyncio.Lock()
+        self.operation_lock = AsyncDesktopGate()
+        self._messages_changed = asyncio.Event()
+        self.generation = 0
+        self.paused = False
+
+    def target_changed(self) -> None:
+        self.anchors = self.store.anchors()
+        self.state = None
+        self.generation += 1
+        previous, self._messages_changed = self._messages_changed, asyncio.Event()
+        previous.set()
+
+    async def wait_for_messages(self, after_id: int, limit: int, timeout: float) -> list[dict]:
+        clock = asyncio.get_running_loop().time
+        deadline = clock() + timeout
+        generation = self.generation
+        while generation == self.generation:
+            changed = self._messages_changed
+            rows = self.store.messages(limit=limit, after_id=after_id)
+            remaining = deadline - clock()
+            if rows or remaining <= 0:
+                return rows
+            try:
+                await asyncio.wait_for(changed.wait(), remaining)
+            except TimeoutError:
+                break
+        return self.store.messages(limit=limit, after_id=after_id) if generation == self.generation else []
 
     def report(self, state: str) -> None:
         if state != self.state:
@@ -104,6 +131,10 @@ class Synchronizer:
             finished_draft=outcome, resolved_attempts=tuple(resolved),
         )
         self.state, self.anchors = "tracking", keys
+        if messages:
+            previous_event = self._messages_changed
+            self._messages_changed = asyncio.Event()
+            previous_event.set()
 
     def commit_send(self, draft: dict, result) -> None:
         witness = result.witness
@@ -185,7 +216,8 @@ class Synchronizer:
         while True:
             try:
                 async with self.operation_lock:
-                    await self.step()
+                    if not self.paused:
+                        await self.step()
                 await self.source.wait_for_change(self.poll_interval)
             except Exception:
                 logger.exception("Message synchronization failed")
