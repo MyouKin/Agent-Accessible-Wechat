@@ -706,9 +706,9 @@ class CompanionTests(unittest.TestCase):
             self.assertFalse(state.mark_decision_started(old, now + 11))
             current = state.next_job(now + 11)
             self.assertEqual(current.id, 2)
-            self.assertFalse(state.mark_decision_started(current, now + 40))
+            self.assertFalse(state.mark_decision_started(current, current.expires_at))
             self.assertIsNone(state.get("last_normal_decision_at"))
-            self.assertIsNone(state.next_job(now + 40))
+            self.assertIsNone(state.next_job(current.expires_at))
 
     def test_readiness_rechecked_before_inference_and_post(self):
         async def exercise(state):
@@ -779,6 +779,16 @@ class CompanionTests(unittest.TestCase):
         self.assertEqual(parse_decision('{"reply":"接到了","quote_message_id":24}'), Decision("接到了", quote_message_id=24))
         self.assertEqual(parse_decision('{"reply":"接到了","quote_message_id":true}'), Decision())
         self.assertEqual(parse_decision('{"reply":"接到了","quote_message_id":"24"}'), Decision())
+
+    def test_structured_reply_can_be_split_without_splitting_formatting(self):
+        decision = parse_decision('{"reply":[" 第一段 ","第二段\\n保持换行"],"quote_message_id":9}')
+        self.assertEqual(decision.replies, ("第一段", "第二段\n保持换行"))
+        self.assertEqual(decision.quote_message_id, 9)
+        self.assertEqual(parse_decision('{"reply":"第一行\\n第二行"}').replies, ("第一行\n第二行",))
+        self.assertEqual(parse_plain_reply("第一段\n\n第二段").replies, ("第一段", "第二段"))
+        for parts in ([], ["一", ""], ["一", "<think>二</think>"], ["一"] * 5, ["字" * 401] * 2):
+            with self.subTest(parts=parts):
+                self.assertEqual(parse_decision(json.dumps({"reply": parts})), Decision())
 
     def test_model_quote_is_scoped_to_exact_recent_prompt_and_known_other(self):
         async def exercise():
@@ -1912,6 +1922,120 @@ class CompanionTests(unittest.TestCase):
 
     def test_synthetic_model_and_bridge_retry(self):
         asyncio.run(self.exercise_synthetic_pipeline())
+
+    def test_multipart_drafts_follow_selection_and_resume_after_partial_delivery(self):
+        async def exercise(state_file, scenario):
+            now = time.time()
+            chat = "合成测试群"
+            key, revision = "session-" + "a" * 24, "selection-multipart"
+            text = "看看这条" if scenario == "blank" else "@群测试昵称 看看这条"
+            target = message(1, now, text, author_kind="human", chat=chat)
+            rows, operations, sent = [], [], []
+            drafts = {}
+            settings = Settings(
+                selective=scenario == "blank", wechat_tools=False,
+                auto_confirm_session_key="session-" + "b" * 24 if scenario == "manual" else key,
+            )
+            model = AsyncMock()
+            replies = ("第一条回复", "第二条回复", "第三条回复")
+            model.decide.return_value = Decision(replies[0], quote_message_id=target["id"],
+                                                 additional_replies=replies[1:])
+            job = Job(target, "selective" if scenario == "blank" else "mention", now + 180, None)
+            request_ids = [job.request_id(operation) for operation in ("draft", "draft-2", "draft-3")]
+
+            def handler(request):
+                path = request.url.path
+                if path == "/status":
+                    return httpx.Response(200, json={
+                        "chat": chat, "source": {"ready": True}, "send_mode": "manual",
+                        "active_session": {"key": key, "name": chat, "kind": "group", "active": True},
+                        "session_selection": {
+                            "revision": "changed" if scenario == "scope-change" and drafts else revision,
+                            "mention_nickname": None if scenario == "blank" else "群测试昵称",
+                        },
+                    })
+                if path == "/drafts" and request.method == "POST":
+                    payload = json.loads(request.content)
+                    request_id = payload["request_id"]
+                    part = request_ids.index(request_id)
+                    operations.append(("create", part + 1))
+                    self.assertEqual(payload["text"], replies[part])
+                    self.assertEqual(payload["session_key"], key)
+                    self.assertEqual(payload["session_revision"], revision)
+                    self.assertFalse(payload["auto_send"])
+                    self.assertEqual(payload.get("quote_message_id"), target["id"] if part == 0 else None)
+                    return httpx.Response(200, json=drafts.setdefault(
+                        part + 1, {"id": part + 1, "status": "pending"},
+                    ))
+                if path.startswith("/drafts/") and path.endswith("/confirm"):
+                    self.assertEqual(request.method, "POST")
+                    self.assertEqual(request.url.params["session_key"], key)
+                    part = int(path.split("/")[2])
+                    operations.append(("confirm", part))
+                    draft = drafts[part]
+                    self.assertEqual(draft["status"], "pending")
+                    if scenario == "uncertain" and part == 2:
+                        draft["status"] = "uncertain"
+                    else:
+                        draft["status"] = "sent"
+                        sent.append(part)
+                    if scenario == "timeout" and part == 2:
+                        raise httpx.ReadTimeout("Bridge confirmed the part before the response was lost", request=request)
+                    return httpx.Response(200, json=draft)
+                if path == "/messages":
+                    return httpx.Response(200, json={"messages": rows})
+                if path == "/messages/new":
+                    after, limit = (int(request.url.params[name]) for name in ("after_id", "limit"))
+                    return httpx.Response(200, json={"messages": [row for row in rows if row["id"] > after][:limit]})
+                if path == "/messages/search":
+                    return httpx.Response(200, json={"messages": []})
+                self.assertEqual(path, "/memories")
+                return httpx.Response(200, json={"memories": []})
+
+            async with httpx.AsyncClient(base_url="http://bridge.test/", transport=httpx.MockTransport(handler)) as http:
+                bridge = BridgeClient(http)
+                with AgentState.open(state_file) as state:
+                    companion = Companion(settings, bridge, model, state)
+                    await companion.poll_once(now)
+                    rows.append(target)
+                    await companion.poll_once(now)
+                    if scenario == "timeout":
+                        with self.assertRaises(httpx.ReadTimeout):
+                            await companion.respond_once(now)
+                        self.assertEqual(state.next_job(now).decision.replies, replies)
+                    else:
+                        await companion.respond_once(now)
+                    self.assertEqual(state.get("offer")["draft_id"], 1)
+                    offered_at = state.get("offer")["at"]
+                    if scenario == "scope-change":
+                        await companion.poll_once(now)
+                    if scenario != "timeout":
+                        self.assertIsNone(state.next_job(now))
+
+                if scenario == "timeout":
+                    with AgentState.open(state_file) as state:
+                        restarted = Companion(settings, bridge, model, state)
+                        await restarted.poll_once(now)
+                        await restarted.respond_once(now)
+                        self.assertEqual(state.get("offer")["at"], offered_at)
+                        self.assertIsNone(state.next_job(now))
+
+            model.decide.assert_awaited_once()
+            expected = {
+                "blank": ([("create", 1), ("create", 2), ("create", 3)], []),
+                "manual": ([("create", 1), ("create", 2), ("create", 3)], []),
+                "scope-change": ([("create", 1)], []),
+                "uncertain": ([("create", 1), ("confirm", 1), ("create", 2), ("confirm", 2)], [1]),
+                "timeout": ([
+                    ("create", 1), ("confirm", 1), ("create", 2), ("confirm", 2),
+                    ("create", 1), ("create", 2), ("create", 3), ("confirm", 3),
+                ], [1, 2, 3]),
+            }
+            self.assertEqual((operations, sent), expected[scenario])
+
+        for scenario in ("blank", "manual", "scope-change", "uncertain", "timeout"):
+            with self.subTest(scenario=scenario), TemporaryDirectory() as directory:
+                asyncio.run(exercise(Path(directory) / "agent.db", scenario))
 
     async def exercise_synthetic_pipeline(self):
         now = time.time()

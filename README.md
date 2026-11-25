@@ -181,7 +181,11 @@ curl --fail --silent -X POST "$bridge_url/drafts/DRAFT_ID/confirm?session_key=$s
 
 Bridge 会重新核对微信窗口、目标会话、可见尾部和空输入框。发送后回读输入框及新消息，结果为 `sent`、`failed` 或 `uncertain`。遇到 `uncertain` 时先核对桌面、会话尾部和草稿状态。相同 `request_id` 的重复请求沿用原草稿。
 
-自动发送需要在 `config.local.yaml` 设置 `send_mode: auto`，重新创建 Bridge，并在 Agent 的 `.env.agent` 设置 `AGENT_AUTO_SEND=true`。直接调用 HTTP 自动发送还须在每个请求中明确传入 `auto_send: true` 和稳定的 `request_id`。可先验证一次普通文本与原生引用的人工流程，再开启自动模式。Agent 在 Bridge 未就绪、目标改变或发送模式不匹配时暂停处理。
+要对一个指定群开启自动发送，在 `.env.agent` 设置 `AGENT_AUTO_CONFIRM_SESSION_KEY` 为该群的 Local key，并重启 Agent。该群处于活跃状态且已配置点名昵称时，Agent 会通过 Bridge 的确认流程发送新回复。其他会话使用人工草稿，已有草稿独立确认。重新选择该群后，配置新的点名昵称即可恢复自动发送。
+
+原有 Bridge 自动模式可在 `config.local.yaml` 设置 `send_mode: auto`，重新创建 Bridge，并在 `.env.agent` 设置 `AGENT_AUTO_SEND=true`。两种 Agent 自动发送配置二选一。直接调用 HTTP 自动发送还须在每个请求中传入 `auto_send: true` 和稳定的 `request_id`。Agent 在 Bridge 未就绪、目标变化或发送模式不匹配时暂停处理。
+
+模型可用 `reply` 字符串数组明确返回多条回复。Agent 按顺序为每段建立独立草稿，自动模式下确认上一条已发送后再处理下一条。结构化回复使用单个字符串时，字符串内的换行保留在同一个气泡中。纯文本重试时用空行划分段落。
 
 ## HTTP 与 MCP
 

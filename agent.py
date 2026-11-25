@@ -34,6 +34,7 @@ OPTIONAL_CONTEXT_TIMEOUT = 5
 MAX_MEDIA_BYTES = 2 * 1024 * 1024
 IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 MAX_REPLY_LENGTH = 800
+MAX_REPLY_PARTS = 4
 MAX_MEMORY_LENGTH = 800
 MODEL_BLOCKED_REASONS = {"content_filter", "refusal"}
 MODEL_FINISH_REASONS = MODEL_BLOCKED_REASONS | {
@@ -174,10 +175,16 @@ class Settings:
     state_path: Path = Path("data/agent.db")
     persona_path: Path = Path(__file__).with_name("persona.md")
     model_providers: tuple[ModelProvider, ...] = ()
+    auto_confirm_session_key: str | None = None
 
     def __post_init__(self) -> None:
-        if self.auto_send and self.allow_unattributed_mentions:
-            raise ValueError("AGENT_ALLOW_UNATTRIBUTED_MENTIONS cannot be combined with AGENT_AUTO_SEND")
+        if self.allow_unattributed_mentions and (self.auto_send or self.auto_confirm_session_key):
+            raise ValueError("AGENT_ALLOW_UNATTRIBUTED_MENTIONS cannot be combined with automatic sending")
+        if self.auto_confirm_session_key is not None:
+            if not re.fullmatch(r"session-[0-9a-f]{24}", self.auto_confirm_session_key):
+                raise ValueError("AGENT_AUTO_CONFIRM_SESSION_KEY must be a verified group session key")
+            if self.auto_send:
+                raise ValueError("Choose either AGENT_AUTO_SEND or AGENT_AUTO_CONFIRM_SESSION_KEY")
 
     @classmethod
     def from_env(cls, demo: bool = False, *, bridge_only: bool = False) -> Settings:
@@ -216,6 +223,7 @@ class Settings:
             state_path=Path(os.getenv("AGENT_STATE_PATH", "data/agent.db")),
             persona_path=Path(os.getenv("AGENT_PERSONA_PATH", str(cls.persona_path))),
             model_providers=providers,
+            auto_confirm_session_key=os.getenv("AGENT_AUTO_CONFIRM_SESSION_KEY", "").strip() or None,
         )
         if providers:
             endpoints = [urlsplit(provider.base_url) for provider in providers]
@@ -233,6 +241,13 @@ class Decision:
     reply: str | None = None
     memory: str | None = None
     quote_message_id: int | None = None
+    additional_replies: tuple[str, ...] = ()
+
+    @property
+    def replies(self) -> tuple[str, ...]:
+        if self.reply is None or not isinstance(self.additional_replies, tuple):
+            return ()
+        return (self.reply, *self.additional_replies)
 
 
 @dataclass(frozen=True)
@@ -499,8 +514,13 @@ class AgentState:
         if row is None:
             return None
         message, reason, expires_at, decision, context_through_id = row
-        return Job(json.loads(message), reason, expires_at, Decision(**json.loads(decision)) if decision else None,
-                   context_through_id)
+        prepared = None
+        if decision:
+            fields = json.loads(decision)
+            if isinstance(fields.get("additional_replies"), list):
+                fields["additional_replies"] = tuple(fields["additional_replies"])
+            prepared = Decision(**fields)
+        return Job(json.loads(message), reason, expires_at, prepared, context_through_id)
 
     def mark_decision_started(self, job: Job, now: float) -> bool:
         with self.db:
@@ -520,6 +540,7 @@ class AgentState:
     def prepare(self, job: Job, decision: Decision) -> None:
         payload = json.dumps({
             "reply": decision.reply, "memory": decision.memory, "quote_message_id": decision.quote_message_id,
+            "additional_replies": decision.additional_replies,
         }, ensure_ascii=False)
         with self.db:
             self.db.execute("UPDATE pending_jobs SET decision=? WHERE id=?", (payload, job.id))
@@ -617,6 +638,13 @@ class BridgeClient:
 
     async def post(self, path: str, **body):
         response = await self.http.post(path, json=body)
+        response.raise_for_status()
+        return response.json()
+
+    async def confirm_draft(self, draft_id: int, session_key: str | None) -> dict:
+        if type(draft_id) is not int or draft_id <= 0:
+            raise ValueError("Invalid Bridge draft ID")
+        response = await self.http.post(f"drafts/{draft_id}/confirm", params=session_parameters(session_key))
         response.raise_for_status()
         return response.json()
 
@@ -729,6 +757,8 @@ quoting another message, or saving a memory.
 
 JSON_OUTPUT_RULES = """
 Output a JSON object with reply and memory as strings or null, and quote_message_id as an integer or null.
+For multiple WeChat messages, use an array of separate strings in reply.
+Use at most four strings, only when separate chat messages read naturally.
 Set quote_message_id only if a native quote helps show which specific recent message you are answering.
 Use an exact ID from quoteable_message_ids. Otherwise use null. Write only your reply in reply.
 Use reply=null only when a reply is optional. Only set memory for a concrete, durable and non-sensitive group
@@ -838,6 +868,21 @@ def valid_reply(value: object) -> str | None:
     return reply
 
 
+def valid_replies(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        reply = valid_reply(value)
+        return (reply,) if reply is not None else ()
+    if not 1 <= len(value) <= MAX_REPLY_PARTS:
+        return ()
+    parts = []
+    for part in value:
+        reply = valid_reply(part)
+        if reply is None:
+            return ()
+        parts.append(reply)
+    return tuple(parts) if sum(map(len, parts)) <= MAX_REPLY_LENGTH else ()
+
+
 def parse_decision(content: object, *, plain_reply_only: bool = False) -> Decision:
     payload = decode_model_json(content)
     if not isinstance(payload, dict) or not payload.keys() <= {"reply", "memory", "quote_message_id"}:
@@ -846,18 +891,22 @@ def parse_decision(content: object, *, plain_reply_only: bool = False) -> Decisi
     if quote is not None and (type(quote) is not int or quote <= 0):
         return Decision()
 
-    reply = valid_reply(payload.get("reply"))
-    if plain_reply_only:
-        return Decision(reply=reply)
-    memory = valid_model_text(payload.get("memory"), MAX_MEMORY_LENGTH)
-    return Decision(reply, memory, quote if reply else None)
+    parts = valid_replies(payload.get("reply"))
+    memory = None if plain_reply_only else valid_model_text(payload.get("memory"), MAX_MEMORY_LENGTH)
+    if not parts:
+        return Decision(memory=memory)
+    return Decision(parts[0], memory, quote, parts[1:])
 
 
 def parse_plain_reply(content: object) -> Decision:
     text = (model_content_text(content) or "").strip()
     if text.startswith(("{", "[", "```")):
         return parse_decision(text, plain_reply_only=True)
-    return Decision(reply=valid_reply(text))
+    reply = valid_reply(text)
+    if reply is None:
+        return Decision()
+    parts = valid_replies(re.split(r"\n[ \t]*\n", reply))
+    return Decision(parts[0], additional_replies=parts[1:]) if parts else Decision(reply=reply)
 
 
 QUOTE_TOOL = "draft_quoted_reply"
@@ -1423,6 +1472,18 @@ class Companion:
         self.native_quote_supported = True
         self.scope = 0
 
+    @property
+    def auto_confirm(self) -> bool:
+        return (
+            self.session_kind == "group" and self.session_key is not None
+            and self.settings.auto_confirm_session_key == self.session_key
+            and self.selection is not None and bool(self.selection.mention_nickname)
+        )
+
+    @property
+    def automatic_sending(self) -> bool:
+        return self.settings.auto_send or self.auto_confirm
+
     def status_is_ready(self, status: dict, chat: str) -> bool:
         source = status.get("source") or {}
         return (
@@ -1478,11 +1539,6 @@ class Companion:
                 chat, latest, session_key=session_key, session_kind=session_kind, session_revision=revision,
             )
             self.chat, self.session_key, self.session_kind = chat, session_key, session_kind
-            LOG.info(
-                "Bridge ready; polling at %.0fs from message %s (%s)",
-                self.settings.poll_seconds, self.state.get("cursor"),
-                "auto-send" if self.settings.auto_send else "drafts",
-            )
         if selection != self.selection and not binding_changed:
             self.scope += 1
         if selection is not None:
@@ -1494,6 +1550,12 @@ class Companion:
             legacy_mentions = session_key in (None, LEGACY_SESSION_KEY) or "session_selection" not in status
             self.mentions = self.settings.mentions if legacy_mentions else ()
         self.selection = selection
+        if binding_changed:
+            LOG.info(
+                "Bridge ready; polling at %.0fs from message %s (%s)",
+                self.settings.poll_seconds, self.state.get("cursor"),
+                "auto-send" if self.automatic_sending else "drafts",
+            )
         self.ready = available
         if not available:
             return
@@ -1501,7 +1563,10 @@ class Companion:
         rows = (await self.bridge.get("messages/new", after_id=cursor, limit=100, **params))["messages"]
         if rows:
             await self.resolve_early_delivery(chat, rows, session_key=session_key)
-            self.state.collect(rows, chat, replace(self.settings, mentions=self.mentions), now, session_kind=session_kind)
+            effective_settings = replace(
+                self.settings, mentions=self.mentions, auto_send=self.automatic_sending, auto_confirm_session_key=None,
+            )
+            self.state.collect(rows, chat, effective_settings, now, session_kind=session_kind)
 
     async def resolve_early_delivery(
         self, chat: str, rows: list[dict], *, session_key: str | None = None,
@@ -1671,7 +1736,9 @@ class Companion:
         scope, session_key = self.scope, self.session_key
         params = session_parameters(session_key)
         decision = job.decision
-        if decision is not None and decision.reply is not None and valid_reply(decision.reply) is None:
+        if decision is not None and (decision.reply is not None or decision.additional_replies) and (
+            not decision.replies or valid_replies(list(decision.replies)) != decision.replies
+        ):
             LOG.warning("Message %s (%s): discarded invalid saved reply", job.id, job.reason)
             self.state.finish(job, supersede=False)
             return 0
@@ -1684,7 +1751,7 @@ class Companion:
             return 0
         actor = sender_key(message) if message is not None else None
         if message is None or (
-            job.reason == "follow-up" and self.settings.auto_send and (not actor or actor[0] == "name")
+            job.reason == "follow-up" and self.automatic_sending and (not actor or actor[0] == "name")
         ):
             self.state.finish(job, supersede=False)
             return 0
@@ -1741,8 +1808,10 @@ class Companion:
             not await self.verify_ready(job.message["chat"]) or self.scope != scope
         ):
             return .5
-        if decision.reply and (
-            not self.settings.allow_unattributed_mentions or not contains_mention(decision.reply, self.mentions)
+        replies = decision.replies
+        if replies and (
+            not self.settings.allow_unattributed_mentions
+            or not any(contains_mention(reply, self.mentions) for reply in replies)
         ):
             if decision.quote_message_id is not None and not self.native_quote_supported:
                 decision = replace(decision, quote_message_id=None)
@@ -1759,30 +1828,59 @@ class Companion:
                         return 0
                     decision = replace(decision, quote_message_id=None)
                     self.state.prepare(job, decision)
-            mode = self.state.reserve_offer(job, time.time(), self.settings.auto_send)
+            mode = self.state.reserve_offer(job, time.time(), self.automatic_sending and not unattributed)
             if mode is None:
                 self.state.finish(job)
                 return 0
             draft: dict[str, object] = {
-                "text": decision.reply, "chat": job.message["chat"], "author_kind": "llm",
-                "request_id": job.request_id("draft"), "auto_send": mode, **params,
+                "chat": job.message["chat"], "author_kind": "llm",
+                "auto_send": mode and self.settings.auto_send, **params,
             }
             if self.selection is not None:
                 draft["session_revision"] = self.selection.revision
-            if decision.quote_message_id is not None:
-                draft["quote_message_id"] = decision.quote_message_id
-            try:
-                result = await self.bridge.post("drafts", **draft)
-                if self.scope == scope:
-                    self.state.link_offer_draft(job.request_id("draft"), result.get("id"))
-                LOG.info("Draft %s: %s", result.get("id"), result.get("status"))
-            except httpx.HTTPStatusError as error:
-                if error.response.status_code != 409:
-                    raise
-                LOG.warning("Bridge rejected the draft (409)")
-                if self.scope == scope:
-                    self.state.finish(job)
-                return 0
+            for part, reply in enumerate(replies, 1):
+                if part > 1:
+                    if self.scope != scope:
+                        return 0
+                    if time.time() >= job.expires_at:
+                        self.state.finish(job)
+                        return 0
+                    if not await self.verify_ready(job.message["chat"]) or self.scope != scope:
+                        return .5
+                request_id = job.request_id("draft" if part == 1 else f"draft-{part}")
+                payload = {**draft, "text": reply, "request_id": request_id}
+                if part == 1 and decision.quote_message_id is not None:
+                    payload["quote_message_id"] = decision.quote_message_id
+                try:
+                    result = await self.bridge.post("drafts", **payload)
+                    if self.scope != scope:
+                        return 0
+                    draft_id = result.get("id")
+                    if part == 1:
+                        self.state.link_offer_draft(request_id, draft_id)
+                    if mode and self.auto_confirm and result.get("status") == "pending":
+                        if not await self.verify_ready(job.message["chat"]) or self.scope != scope:
+                            return .5
+                        if time.time() >= job.expires_at:
+                            self.state.finish(job)
+                            return 0
+                        result = await self.bridge.confirm_draft(draft_id, session_key)
+                except httpx.HTTPStatusError as error:
+                    if error.response.status_code != 409:
+                        raise
+                    LOG.warning("Bridge rejected the draft (409)")
+                    if self.scope == scope:
+                        self.state.finish(job)
+                    return 0
+                if self.scope != scope:
+                    return 0
+                status = result.get("status")
+                LOG.info("Draft %s: %s", result.get("id"), status)
+                if mode and (self.auto_confirm or len(replies) > 1) and status != "sent":
+                    if status in {"pending", "sending"}:
+                        return .5
+                    # An unconfirmed send cannot be followed by another chat message.
+                    break
         if self.scope == scope and decision.memory and not unattributed:
             await self.bridge.post(
                 "memories", kind="summary", text=decision.memory, chat=job.message["chat"],
@@ -1932,6 +2030,7 @@ async def run(settings: Settings, demo: bool, *, session_key: str | None = None)
             print(json.dumps({
                 "synthetic_demo": True, "reply": decision.reply, "memory": decision.memory,
                 "quote_message_id": decision.quote_message_id,
+                **({"reply_parts": decision.replies} if decision.additional_replies else {}),
             }, ensure_ascii=False))
             return
         headers = {"Authorization": f"Bearer {settings.bridge_token}"}
