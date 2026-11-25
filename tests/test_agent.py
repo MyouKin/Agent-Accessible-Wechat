@@ -16,8 +16,9 @@ import httpx
 from PIL import Image
 
 from agent import (
-    AgentState, BridgeClient, Companion, Decision, Job, LEGACY_WECHAT_CATALOG, ModelClient, Settings,
-    main, parse_decision, parse_plain_reply, quote_tool_decision, was_mentioned,
+    AgentState, BridgeClient, Companion, Decision, FallbackModelClient, Job, LEGACY_WECHAT_CATALOG,
+    ModelClient, ModelProvider, Settings, main, parse_decision, parse_plain_reply, quote_tool_decision,
+    was_mentioned,
 )
 from bridge.config import Settings as BridgeSettings
 from bridge.models import Message, Snapshot
@@ -31,6 +32,181 @@ def message(id, timestamp, text, **overrides):
         "text": text, "type": "text", "observed_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
     }
     return row | overrides
+
+
+class ModelRoutingTests(unittest.TestCase):
+    provider_env = {
+        "LLM_PROVIDER_ORDER": "gemma,deepseek",
+        "LLM_GEMMA_BASE_URL": "http://gemma.test:11434",
+        "LLM_GEMMA_PROTOCOL": "ollama",
+        "LLM_GEMMA_MODEL": "gemma:12b",
+        "LLM_GEMMA_MAX_TOKENS": "80",
+        "LLM_DEEPSEEK_BASE_URL": "https://api.deepseek.test/v1",
+        "LLM_DEEPSEEK_MODEL": "deepseek-chat",
+        "LLM_DEEPSEEK_API_KEY": "synthetic-cloud-key",
+        "LLM_DEEPSEEK_MAX_TOKENS": "120",
+        "LLM_DEEPSEEK_REASONING_EFFORT": "none",
+    }
+
+    def run_demo(self, env, handler):
+        real_client = httpx.AsyncClient
+        output = StringIO()
+
+        def mock_client(**kwargs):
+            self.assertIs(kwargs["trust_env"], False)
+            return real_client(**kwargs, transport=httpx.MockTransport(handler))
+
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch("sys.argv", ["agent", "--demo"]),
+            patch("agent.httpx.AsyncClient", side_effect=mock_client),
+            redirect_stdout(output),
+        ):
+            main()
+        return json.loads(output.getvalue())
+
+    def test_lan_gemma_falls_back_to_keyed_chat_completions(self):
+        failures = {
+            "connection": httpx.ConnectError,
+            "server": 503,
+            "invalid_response": 200,
+            "unusable_reply": None,
+        }
+        for failure, result in failures.items():
+            with self.subTest(failure=failure):
+                requests = []
+
+                def handler(request):
+                    requests.append(request.url.host)
+                    payload = json.loads(request.content)
+                    if request.url.host == "gemma.test":
+                        self.assertEqual(request.url.path, "/api/chat")
+                        self.assertNotIn("Authorization", request.headers)
+                        self.assertEqual(payload["model"], "gemma:12b")
+                        self.assertIs(payload["stream"], False)
+                        self.assertEqual(payload["options"]["num_predict"], 80)
+                        self.assertNotIn("max_tokens", payload)
+                        self.assertNotIn("reasoning_effort", payload)
+                        if result is httpx.ConnectError:
+                            raise httpx.ConnectError("synthetic connection failure", request=request)
+                        if result is None:
+                            return httpx.Response(200, json={
+                                "done": True, "done_reason": "length",
+                                "message": {"role": "assistant", "content": ""},
+                            })
+                        return httpx.Response(result, json={"error": "synthetic invalid response"})
+
+                    self.assertEqual(request.url.host, "api.deepseek.test")
+                    self.assertEqual(request.url.path, "/v1/chat/completions")
+                    self.assertEqual(request.headers["Authorization"], "Bearer synthetic-cloud-key")
+                    self.assertEqual(payload["model"], "deepseek-chat")
+                    self.assertEqual(payload["max_tokens"], 120)
+                    self.assertEqual(payload["reasoning_effort"], "none")
+                    return httpx.Response(200, json={"choices": [{
+                        "finish_reason": "stop", "message": {"content": '{"reply":"云端回复"}'},
+                    }]})
+
+                self.assertEqual(self.run_demo(self.provider_env, handler)["reply"], "云端回复")
+                gemma_attempts = 2 if failure == "unusable_reply" else 1
+                self.assertEqual(requests, ["gemma.test"] * gemma_attempts + ["api.deepseek.test"])
+
+    def test_configured_order_and_stops_on_success(self):
+        env = self.provider_env | {"LLM_PROVIDER_ORDER": "deepseek,gemma"}
+        requests = []
+        cloud_available = False
+
+        def handler(request):
+            requests.append(request.url.host)
+            if request.url.host == "api.deepseek.test":
+                if not cloud_available:
+                    return httpx.Response(429, json={"error": "synthetic rate limit"})
+                return httpx.Response(200, json={"choices": [{
+                    "finish_reason": "stop", "message": {"content": '{"reply":"云端恢复"}'},
+                }]})
+            self.assertEqual(request.url.host, "gemma.test")
+            return httpx.Response(200, json={
+                "done": True, "done_reason": "stop", "message": {
+                    "role": "assistant", "content": '{"reply":"本地回复"}',
+                },
+            })
+
+        self.assertEqual(self.run_demo(env, handler)["reply"], "本地回复")
+        cloud_available = True
+        self.assertEqual(self.run_demo(env, handler)["reply"], "云端恢复")
+        self.assertEqual(requests, ["api.deepseek.test", "gemma.test", "api.deepseek.test"])
+
+    def test_provider_filter_or_refusal_does_not_call_next_provider(self):
+        env = self.provider_env | {"LLM_PROVIDER_ORDER": "deepseek,gemma"}
+        for choice in (
+            {"finish_reason": "content_filter", "message": {"content": ""}},
+            {"finish_reason": "stop", "message": {"content": "", "refusal": "synthetic refusal"}},
+        ):
+            with self.subTest(finish_reason=choice["finish_reason"]):
+                requests = []
+
+                def handler(request):
+                    requests.append(request.url.host)
+                    return httpx.Response(200, json={"choices": [choice]})
+
+                self.assertIsNone(self.run_demo(env, handler)["reply"])
+                self.assertEqual(requests, ["api.deepseek.test"])
+
+    def test_intentional_silence_on_selective_messages_is_a_valid_decision(self):
+        requested = []
+
+        def handler(request):
+            requested.append(request.url.host)
+            return httpx.Response(200, json={"choices": [{
+                "finish_reason": "stop", "message": {"content": '{"reply":null,"memory":null}'},
+            }]})
+
+        async def exercise():
+            gemma = ModelProvider("gemma", "http://gemma.test/v1", "gemma")
+            deepseek = ModelProvider("deepseek", "https://api.deepseek.test/v1", "deepseek-chat")
+            transport = httpx.MockTransport(handler)
+            async with (
+                httpx.AsyncClient(base_url=gemma.base_url, transport=transport) as primary,
+                httpx.AsyncClient(base_url=deepseek.base_url, transport=transport) as fallback,
+            ):
+                model = FallbackModelClient([
+                    (gemma, ModelClient(primary, gemma.model, "合成人格")),
+                    (deepseek, ModelClient(fallback, deepseek.model, "合成人格")),
+                ])
+                now = time.time()
+                row = message(1, now, "合成闲聊", author_kind="human")
+                job = Job(row, "selective", now + 60, None)
+                self.assertEqual(await model.decide(job, [row], [], [], []), Decision())
+
+        asyncio.run(exercise())
+        self.assertEqual(requested, ["gemma.test"])
+
+    def test_legacy_model_environment_still_reaches_chat_completions(self):
+        env = {
+            "LLM_BASE_URL": "http://127.0.0.1:8080/v1/",
+            "LLM_MODEL": "legacy-model",
+            "LLM_API_KEY": "synthetic-legacy-key",
+        }
+
+        def handler(request):
+            self.assertEqual(str(request.url), "http://127.0.0.1:8080/v1/chat/completions")
+            self.assertEqual(request.headers["Authorization"], "Bearer synthetic-legacy-key")
+            self.assertEqual(json.loads(request.content)["model"], "legacy-model")
+            return httpx.Response(200, json={"choices": [{
+                "message": {"content": '{"reply":"兼容旧配置"}'},
+            }]})
+
+        self.assertEqual(self.run_demo(env, handler)["reply"], "兼容旧配置")
+
+    def test_every_live_provider_requires_consent_if_non_loopback(self):
+        env = self.provider_env | {
+            "LLM_GEMMA_BASE_URL": "http://127.0.0.1:11434",
+            "BRIDGE_TOKEN": "synthetic-bridge-token",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            with self.assertRaisesRegex(ValueError, "AGENT_DATA_CONSENT"):
+                Settings.from_env()
+            with patch.dict("os.environ", {"AGENT_DATA_CONSENT": "true"}):
+                Settings.from_env()
 
 
 class CompanionTests(unittest.TestCase):

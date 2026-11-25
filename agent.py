@@ -16,8 +16,8 @@ import sqlite3
 import time
 import unicodedata
 from collections.abc import Awaitable, Callable
-from contextlib import closing, contextmanager
-from dataclasses import dataclass, replace
+from contextlib import AsyncExitStack, closing, contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
@@ -65,16 +65,16 @@ def seconds(name: str, default: float, minimum: float = 0) -> float:
     return value
 
 
-def max_tokens_from_env() -> int | None:
-    value = os.getenv("LLM_MAX_TOKENS", "").strip()
+def max_tokens_from_env(name: str = "LLM_MAX_TOKENS") -> int | None:
+    value = os.getenv(name, "").strip()
     if not value:
         return None
     try:
         limit = int(value)
     except ValueError as error:
-        raise ValueError("LLM_MAX_TOKENS must be a positive integer") from error
+        raise ValueError(f"{name} must be a positive integer") from error
     if limit < 1:
-        raise ValueError("LLM_MAX_TOKENS must be a positive integer")
+        raise ValueError(f"{name} must be a positive integer")
     return limit
 
 
@@ -99,11 +99,63 @@ def is_loopback(host: str) -> bool:
 
 
 @dataclass(frozen=True)
+class ModelProvider:
+    name: str
+    base_url: str
+    model: str
+    api_key: str = field(default="", repr=False)
+    protocol: str = "openai"
+    max_tokens: int | None = None
+    reasoning_effort: str | None = None
+    quote_tool: bool = False
+    tools: bool = True
+    multimodal: bool = False
+    timeout: float = 45
+
+    @classmethod
+    def from_env(cls, name: str) -> ModelProvider:
+        prefix = f"LLM_{name.upper()}_"
+        base_url = os.getenv(prefix + "BASE_URL", "").strip().rstrip("/")
+        endpoint = parse_endpoint(base_url, prefix + "BASE_URL")
+        model = os.getenv(prefix + "MODEL", "").strip()
+        if not model:
+            raise ValueError(f"{prefix}MODEL is required")
+        protocol = os.getenv(prefix + "PROTOCOL", "openai").strip().lower()
+        if protocol not in {"openai", "ollama"}:
+            raise ValueError(f"{prefix}PROTOCOL must be openai or ollama")
+        reasoning_effort = os.getenv(prefix + "REASONING_EFFORT", "").strip() or None
+        quote_tool = flag(prefix + "QUOTE_TOOL")
+        tools = flag(prefix + "TOOLS", protocol == "openai")
+        if protocol == "ollama":
+            if endpoint.path.rstrip("/").endswith(("/v1", "/api", "/api/chat")):
+                raise ValueError(f"{prefix}BASE_URL must precede /api/chat for the Ollama protocol")
+            if reasoning_effort is not None or quote_tool or tools:
+                raise ValueError(f"{prefix}REASONING_EFFORT, QUOTE_TOOL and TOOLS require the openai protocol")
+        return cls(
+            name=name, base_url=base_url, model=model, api_key=os.getenv(prefix + "API_KEY", "").strip(),
+            protocol=protocol, max_tokens=max_tokens_from_env(prefix + "MAX_TOKENS"),
+            reasoning_effort=reasoning_effort, quote_tool=quote_tool, tools=tools,
+            multimodal=flag(prefix + "MULTIMODAL"),
+            timeout=seconds(prefix + "TIMEOUT_SECONDS", 45, .1),
+        )
+
+
+def model_providers_from_env() -> tuple[ModelProvider, ...]:
+    order = os.getenv("LLM_PROVIDER_ORDER", "").strip()
+    if not order:
+        return ()
+    names = [name.strip().lower() for name in order.split(",")]
+    if len(set(names)) != len(names) or any(not re.fullmatch(r"[a-z][a-z0-9_]*", name) for name in names):
+        raise ValueError("LLM_PROVIDER_ORDER must contain unique comma-separated provider names")
+    return tuple(ModelProvider.from_env(name) for name in names)
+
+
+@dataclass(frozen=True)
 class Settings:
     bridge_url: str = "http://127.0.0.1:8765"
     bridge_token: str = ""
     llm_url: str = ""
-    llm_key: str = ""
+    llm_key: str = field(default="", repr=False)
     model: str = ""
     max_tokens: int | None = None
     reasoning_effort: str | None = None
@@ -121,6 +173,7 @@ class Settings:
     follow_up_window: float = 180
     state_path: Path = Path("data/agent.db")
     persona_path: Path = Path(__file__).with_name("persona.md")
+    model_providers: tuple[ModelProvider, ...] = ()
 
     def __post_init__(self) -> None:
         if self.auto_send and self.allow_unattributed_mentions:
@@ -136,15 +189,16 @@ class Settings:
                 raise ValueError("BRIDGE_TOKEN is required")
         if bridge_only:
             return cls(bridge_url=bridge_url, bridge_token=bridge_token)
+        providers = model_providers_from_env()
         settings = cls(
             bridge_url=bridge_url,
             bridge_token=bridge_token,
             llm_url=os.getenv("LLM_BASE_URL", "").rstrip("/"),
             llm_key=os.getenv("LLM_API_KEY", ""),
             model=os.getenv("LLM_MODEL", ""),
-            max_tokens=max_tokens_from_env(),
-            reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "").strip() or None,
-            quote_tool=flag("LLM_QUOTE_TOOL"),
+            max_tokens=None if providers else max_tokens_from_env(),
+            reasoning_effort=None if providers else os.getenv("LLM_REASONING_EFFORT", "").strip() or None,
+            quote_tool=False if providers else flag("LLM_QUOTE_TOOL"),
             wechat_tools=flag("AGENT_WECHAT_TOOLS", True),
             mentions=tuple(
                 alias.strip() for alias in os.getenv("AGENT_MENTIONS", "阿桥").split(",")
@@ -161,13 +215,15 @@ class Settings:
             follow_up_window=seconds("AGENT_FOLLOW_UP_WINDOW", 180),
             state_path=Path(os.getenv("AGENT_STATE_PATH", "data/agent.db")),
             persona_path=Path(os.getenv("AGENT_PERSONA_PATH", str(cls.persona_path))),
+            model_providers=providers,
         )
-        endpoint = parse_endpoint(settings.llm_url, "LLM_BASE_URL")
-        if not settings.model.strip():
-            raise ValueError("LLM_MODEL is required")
-        if demo:
-            return settings
-        if not is_loopback(endpoint.hostname) and not flag("AGENT_DATA_CONSENT"):
+        if providers:
+            endpoints = [urlsplit(provider.base_url) for provider in providers]
+        else:
+            endpoints = [parse_endpoint(settings.llm_url, "LLM_BASE_URL")]
+            if not settings.model.strip():
+                raise ValueError("LLM_MODEL is required")
+        if not demo and any(not is_loopback(endpoint.hostname) for endpoint in endpoints) and not flag("AGENT_DATA_CONSENT"):
             raise ValueError("A non-loopback model requires AGENT_DATA_CONSENT=true for live data. Use --demo for synthetic data.")
         return settings
 
@@ -966,10 +1022,21 @@ def model_rejects_tools(error: httpx.HTTPStatusError) -> bool:
     ))
 
 
+class ModelResponseError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class ModelResult:
+    decision: Decision
+    usable: bool = True
+
+
 class ModelClient:
     def __init__(
         self, http: httpx.AsyncClient, model: str, persona: str, *,
         max_tokens: int | None = None, reasoning_effort: str | None = None, quote_tool: bool = False,
+        protocol: str = "openai",
     ):
         self.http = http
         self.model = model
@@ -977,14 +1044,26 @@ class ModelClient:
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
         self.quote_tool = quote_tool
+        self.protocol = protocol
 
     async def decide(
         self, job: Job, recent: list[dict], history: list[dict], memories: list[dict],
         images: list[tuple[int, str]], *, require_quote_tool: bool = False,
         tool_catalog: list[dict] | None = None, call_tool: ConversationCall | None = None,
     ) -> Decision:
+        result = await self.decide_with_status(
+            job, recent, history, memories, images, require_quote_tool=require_quote_tool,
+            tool_catalog=tool_catalog, call_tool=call_tool,
+        )
+        return result.decision
+
+    async def decide_with_status(
+        self, job: Job, recent: list[dict], history: list[dict], memories: list[dict],
+        images: list[tuple[int, str]], *, require_quote_tool: bool = False,
+        tool_catalog: list[dict] | None = None, call_tool: ConversationCall | None = None,
+    ) -> ModelResult:
         if job.message.get("author_kind") == "llm" or not in_model_context(job.message):
-            return Decision()
+            return ModelResult(Decision())
         chat = job.message["chat"]
         recent_context = bounded_context(
             [row for row in recent if row.get("chat") == chat and in_model_context(row)], RECENT_CONTEXT_BUDGET,
@@ -995,7 +1074,7 @@ class ModelClient:
             if job.reason != "unattributed-mention" else []
         )
         if require_quote_tool and not quoteable_ids:
-            return Decision()
+            return ModelResult(Decision())
         offer_tool = bool(quoteable_ids) and (self.quote_tool or require_quote_tool)
         conversation_tools = (
             conversation_functions(tool_catalog)
@@ -1119,11 +1198,11 @@ class ModelClient:
                 attempt += 1
         if finish_reason in MODEL_BLOCKED_REASONS:
             LOG.warning("Message %s (%s): model attempt %s blocked (%s)", job.id, job.reason, attempt, finish_reason)
-            return Decision()
+            return ModelResult(Decision())
         if output.get("tool_calls"):
             decision = quote_tool_decision(output["tool_calls"]) if offer_tool else Decision()
         elif require_quote_tool:
-            return Decision()
+            return ModelResult(Decision(), usable=False)
         else:
             decision = parse_decision(output.get("content"))
         if decision.quote_message_id is not None and decision.quote_message_id not in quoteable_ids:
@@ -1149,32 +1228,119 @@ class ModelClient:
             attempt += 1
             if finish_reason in MODEL_BLOCKED_REASONS:
                 LOG.warning("Message %s (%s): model attempt %s blocked (%s)", job.id, job.reason, attempt, finish_reason)
-                return Decision()
+                return ModelResult(Decision())
             if finish_reason in {"stop", "unknown"} and not retry.get("tool_calls"):
                 plain = parse_plain_reply(retry.get("content"))
                 if plain.reply:
                     LOG.info("Message %s (%s): accepted plain text from model attempt %s", job.id, job.reason, attempt)
-                    return plain
+                    return ModelResult(plain)
             LOG.warning("Message %s (%s): model attempt %s had no usable plain text (%s)",
                         job.id, job.reason, attempt, finish_reason)
-        return decision
+            return ModelResult(decision, usable=False)
+        if decision.reply or decision.memory:
+            return ModelResult(decision)
+        fields = decode_model_json(output.get("content"))
+        intentional_silence = (
+            not output.get("tool_calls") and finish_reason in {"stop", "unknown"}
+            and isinstance(fields, dict) and "reply" in fields
+            and fields.keys() <= {"reply", "memory", "quote_message_id"}
+            and all(value is None for value in fields.values())
+        )
+        return ModelResult(decision, usable=intentional_silence)
 
     async def _completion(self, payload: dict[str, object]) -> tuple[dict, str]:
-        response = await self.http.post("chat/completions", json=payload)
+        if self.protocol == "ollama":
+            messages = []
+            for message in payload["messages"]:
+                content = message["content"]
+                if isinstance(content, list):
+                    messages.append({
+                        "role": message["role"],
+                        "content": "\n".join(part["text"] for part in content if part["type"] == "text"),
+                        "images": [part["image_url"]["url"].split(",", 1)[1] for part in content if part["type"] == "image_url"],
+                    })
+                else:
+                    messages.append(message)
+            request = {"model": self.model, "messages": messages, "stream": False}
+            if self.max_tokens is not None:
+                request["options"] = {"num_predict": self.max_tokens}
+            response = await self.http.post("api/chat", json=request)
+        else:
+            response = await self.http.post("chat/completions", json=payload)
         response.raise_for_status()
         try:
-            choice = response.json()["choices"][0]
+            body = response.json()
+            if self.protocol == "ollama":
+                if body.get("done") is False:
+                    raise TypeError("incomplete Ollama response")
+                choice = body
+                finish_reason = choice.get("done_reason")
+            else:
+                choice = body["choices"][0]
+                finish_reason = choice.get("finish_reason")
             output = choice["message"]
-        except (ValueError, KeyError, IndexError, TypeError) as error:
-            raise ValueError("The model response did not match Chat Completions") from error
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError, RecursionError) as error:
+            raise ModelResponseError("The provider returned an invalid chat completion") from error
         if not isinstance(output, dict):
-            raise ValueError("The model response did not match Chat Completions")
-        finish_reason = choice.get("finish_reason")
+            raise ModelResponseError("The provider returned an invalid chat completion")
         if output.get("refusal") and finish_reason != "content_filter":
             return output, "refusal"
         if not isinstance(finish_reason, str) or finish_reason not in MODEL_FINISH_REASONS:
             finish_reason = "unknown"
         return output, finish_reason
+
+
+class FallbackModelClient:
+    def __init__(self, clients: list[tuple[ModelProvider, ModelClient]]):
+        self.clients = clients
+
+    async def decide(
+        self, job: Job, recent: list[dict], history: list[dict], memories: list[dict],
+        images: list[tuple[int, str]], *, require_quote_tool: bool = False,
+        tool_catalog: list[dict] | None = None, call_tool: ConversationCall | None = None,
+    ) -> Decision:
+        tool_used = False
+        last_error = None
+        incomplete_decision = None
+
+        async def read_once(name: str, arguments: dict) -> object:
+            nonlocal tool_used
+            tool_used = True
+            return await call_tool(name, arguments)
+
+        for index, (provider, client) in enumerate(self.clients):
+            if require_quote_tool and provider.protocol != "openai":
+                continue
+            remaining = job.expires_at - time.time()
+            if remaining <= 0:
+                break
+            offer_tools = provider.tools and not tool_used and call_tool is not None
+            try:
+                async with asyncio.timeout(min(provider.timeout, remaining)):
+                    result = await client.decide_with_status(
+                        job, recent, history, memories, images if provider.multimodal else [],
+                        require_quote_tool=require_quote_tool,
+                        tool_catalog=tool_catalog if offer_tools else None,
+                        call_tool=read_once if offer_tools else None,
+                    )
+            except (httpx.HTTPError, ModelResponseError, TimeoutError) as error:
+                last_error = error
+                log_failure(f"Model provider {provider.name}", error)
+                continue
+            if result.usable:
+                if index:
+                    LOG.info("Message %s (%s): used fallback provider %s", job.id, job.reason, provider.name)
+                return result.decision
+            LOG.info("Message %s (%s): provider %s returned no usable decision", job.id, job.reason, provider.name)
+            if incomplete_decision is None:
+                incomplete_decision = result.decision
+        if incomplete_decision is not None:
+            return incomplete_decision
+        if isinstance(last_error, TimeoutError):
+            raise ModelResponseError("The model provider timed out") from last_error
+        if last_error is not None:
+            raise last_error
+        return Decision()
 
 
 def search_term(text: str) -> str | None:
@@ -1185,7 +1351,7 @@ def search_term(text: str) -> str | None:
 
 
 class Companion:
-    def __init__(self, settings: Settings, bridge: BridgeClient, model: ModelClient, state: AgentState):
+    def __init__(self, settings: Settings, bridge: BridgeClient, model: ModelClient | FallbackModelClient, state: AgentState):
         self.settings = settings
         self.bridge = bridge
         self.model = model
@@ -1626,18 +1792,37 @@ async def manage_sessions(settings: Settings, key: str | None = None) -> None:
 
 async def run(settings: Settings, demo: bool, *, session_key: str | None = None) -> None:
     persona = settings.persona_path.read_text(encoding="utf-8")
-    llm_headers = {"Authorization": f"Bearer {settings.llm_key}"} if settings.llm_key else {}
-    async with httpx.AsyncClient(base_url=settings.llm_url + "/", headers=llm_headers, timeout=75, trust_env=False) as http:
-        model = ModelClient(
-            http, settings.model, persona,
-            max_tokens=settings.max_tokens, reasoning_effort=settings.reasoning_effort, quote_tool=settings.quote_tool,
-        )
+    async with AsyncExitStack() as stack:
+        if settings.model_providers:
+            clients = []
+            for provider in settings.model_providers:
+                headers = {"Authorization": f"Bearer {provider.api_key}"} if provider.api_key else {}
+                timeout = httpx.Timeout(provider.timeout, connect=min(5, provider.timeout))
+                http = await stack.enter_async_context(httpx.AsyncClient(
+                    base_url=provider.base_url + "/", headers=headers, timeout=timeout, trust_env=False,
+                ))
+                clients.append((provider, ModelClient(
+                    http, provider.model, persona, protocol=provider.protocol,
+                    max_tokens=provider.max_tokens, reasoning_effort=provider.reasoning_effort,
+                    quote_tool=provider.quote_tool,
+                )))
+            model = FallbackModelClient(clients)
+        else:
+            headers = {"Authorization": f"Bearer {settings.llm_key}"} if settings.llm_key else {}
+            http = await stack.enter_async_context(httpx.AsyncClient(
+                base_url=settings.llm_url + "/", headers=headers, timeout=75, trust_env=False,
+            ))
+            model = ModelClient(
+                http, settings.model, persona,
+                max_tokens=settings.max_tokens, reasoning_effort=settings.reasoning_effort, quote_tool=settings.quote_tool,
+            )
         if demo:
             conversation = [
                 {"id": 1, "chat": "合成群", "sender": "测试成员甲", "text": "周六下午一起去看展吗？", "is_self": False, "type": "text"},
                 {"id": 2, "chat": "合成群", "sender": "测试成员乙", "text": "@阿桥 给我一句简短的群聊回复。", "is_self": False, "type": "text"},
             ]
-            job = Job(conversation[-1], "mention", time.time() + 60, None)
+            demo_budget = sum(provider.timeout for provider in settings.model_providers) or 60
+            job = Job(conversation[-1], "mention", time.time() + demo_budget, None)
             decision = await model.decide(job, conversation, [], [], [])
             print(json.dumps({
                 "synthetic_demo": True, "reply": decision.reply, "memory": decision.memory,

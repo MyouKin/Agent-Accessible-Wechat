@@ -1,6 +1,6 @@
 # Agent-Accessible-Wechat
 
-在独立的 Docker 桌面中运行官方 Linux 微信，通过 AT-SPI2 读取一个已选定的群聊或私聊。Bridge 负责消息同步、SQLite 和受控发送。宿主机 Agent 负责人格、记忆与模型调用，可以接入兼容 Chat Completions 的云端服务或本地 llama.cpp。默认以人工确认方式发送。
+在独立的 Docker 桌面中运行官方 Linux 微信，通过 AT-SPI2 读取一个已选定的群聊或私聊。Bridge 负责消息同步、SQLite 和受控发送。宿主机 Agent 负责人格、记忆与模型调用，支持通过 Ollama 或 Chat Completions 接入局域网模型，并按配置顺序回退到 DeepSeek 等服务。默认以人工确认方式发送。
 
 单会话采集、陪伴回复与[微信桌面操作](#微信桌面工具与登录)共用一个官方客户端。Bridge 为 Agent 的 HTTP API 和可选的 MCP 端点提供同一份工具目录。项目自身负责消息归属、同步、记忆、回复决策和发送校验。
 
@@ -13,7 +13,7 @@ flowchart LR
     B -->|受控 X11 操作| W
     B --> D[("SQLite / 本地图片")]
     A["宿主机 Agent"] <-->|HTTP| B
-    A <-->|Chat Completions| L["云端 API 或本地 llama.cpp"]
+    A <-->|Chat Completions / Ollama| L["局域网模型或云端 API"]
     M["可选 MCP 客户端"] <-->|/mcp| B
     B <-->|容器内 Unix socket| T["微信桌面工具进程"]
     T -->|串行化桌面操作| W
@@ -261,7 +261,35 @@ if [ ! -e .env.agent ]; then
 fi
 ```
 
-在 `.env.agent` 填写 `LLM_BASE_URL`、`LLM_MODEL` 和提供方需要的 `LLM_API_KEY`，然后设置 `AGENT_MENTIONS` 为账号在目标群中的真实显示昵称。多个别名以逗号分隔。项目提供的 `persona.md` 是可编辑的原始人格示例。私有人格可另存为 UTF-8 Markdown，并将 `AGENT_PERSONA_PATH` 指向该文件，重启 Agent 后生效。建议使用本机私有文件或安全输入保存模型密钥，Compose 容器只读取其声明的 Bridge 凭据。 [uv 环境文件](https://docs.astral.sh/uv/configuration/files/#environment-variable-files)
+在 `.env.agent` 按下节配置模型，再将 `AGENT_MENTIONS` 设置为账号在目标群中的真实显示昵称。多个别名以逗号分隔。项目提供的 `persona.md` 是可编辑的原始人格示例。私有人格可另存为 UTF-8 Markdown，并将 `AGENT_PERSONA_PATH` 指向该文件，重启 Agent 后生效。模型密钥保存在仅当前用户可读的环境文件中。 [uv 环境文件](https://docs.astral.sh/uv/configuration/files/#environment-variable-files)
+
+### 模型优先级与自动回退
+
+在 `.env.agent` 设置 `LLM_PROVIDER_ORDER` 后，Agent 每轮按逗号分隔的顺序尝试提供方。从配置名称的大写形式得到变量前缀，例如 `gemma` 对应 `LLM_GEMMA_`。下面先调用局域网的 Ollama Gemma，失败时调用 DeepSeek。将地址、模型名和密钥替换成实际值。 [Ollama Chat API](https://docs.ollama.com/api/chat) · [DeepSeek Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/)
+
+```dotenv
+LLM_PROVIDER_ORDER=gemma,deepseek
+LLM_GEMMA_PROTOCOL=ollama
+LLM_GEMMA_BASE_URL=http://192.168.8.100:11434
+LLM_GEMMA_MODEL=gemma4
+LLM_GEMMA_TIMEOUT_SECONDS=30
+LLM_DEEPSEEK_BASE_URL=https://api.deepseek.com
+LLM_DEEPSEEK_MODEL=deepseek-flash
+LLM_DEEPSEEK_API_KEY=替换为实际密钥
+LLM_DEEPSEEK_REASONING_EFFORT=none
+```
+
+| 每个提供方的变量后缀 | 用途 |
+| --- | --- |
+| `BASE_URL` / `MODEL` | 必填。Ollama 原生协议填写 `/api/chat` 之前的地址。Chat Completions 填写 `/chat/completions` 之前的地址，例如 llama.cpp 的 `http://127.0.0.1:8080/v1`。 |
+| `PROTOCOL` / `API_KEY` | 协议默认 `openai`，也可设为 `ollama`。密钥存在时作为该提供方的 Bearer 令牌。 |
+| `TIMEOUT_SECONDS` / `MAX_TOKENS` | 每轮在该提供方的总时限默认 45 秒。生成长度上限由提供方默认值决定，也可单独设置。 |
+| `REASONING_EFFORT` / `TOOLS` / `QUOTE_TOOL` | 适用于 `openai` 协议。`TOOLS` 默认允许当前会话的只读工具，`QUOTE_TOOL` 默认关闭。模型不支持相应能力时，可关闭对应工具。 |
+| `MULTIMODAL` | 默认关闭。给支持视觉且获准接收图片的提供方设为 `true`，同时开启 `AGENT_MULTIMODAL` 才会发送图片。 |
+
+连接失败、超时、HTTP 错误或模型重试后仍未生成可用结果时，会尝试下一个提供方。模型明确拒绝、触发内容过滤或在无需回复时返回 `reply: null`，会结束本轮。日志记录提供方名称和错误类型。用于本地小飞鱼等兼容服务时，可将它加入 `LLM_PROVIDER_ORDER`，使用服务实际公布的模型名和 `/v1` 地址。
+
+`LLM_PROVIDER_ORDER` 留空时，按原方式使用单一 Chat Completions 提供方，配置 `LLM_BASE_URL`、`LLM_MODEL` 和可选的 `LLM_API_KEY`。优先级列表中只要有一个非环回地址，处理真实会话前就需要设置 `AGENT_DATA_CONSENT=true`。
 
 ### 首次选择会话
 
@@ -311,7 +339,7 @@ SQLite 按会话保存已同步的消息、草稿和长期记忆。群聊与同�
 - 模型首先使用结构化回复，支持工具的提供方可启用 `LLM_QUOTE_TOOL=true`。紧急触发可进行一次纯文本重试。模型仍无可用结果时，Agent 可对已验证的紧急触发生成简短确认，仍受同样的发送校验与幂等约束。
 - 模型默认从共享目录获得当前会话的近期消息、消息查找、增量、历史搜索、记忆搜索和即时读取，每次决策最多查一次。Agent 读取已保存的消息、媒体和记忆以及调用查询工具时使用当前会话键。Bridge 校验目标和参数。私聊及无法用桌面工具核验的群聊，使用已核验的 AT-SPI 快照执行即时读取。可用 `AGENT_WECHAT_TOOLS=false` 关闭模型的额外查询。
 - `AGENT_SELECTIVE_PARTICIPATION=false` 关闭普通选择性参与。引用中的旧正文作为上下文，只有新正文的点名才触发直接点名。人类群友、同账号真人和 Agent 自己生成的消息以不同归属提供给模型。
-- `AGENT_MULTIMODAL=true` 允许视觉模型从 Bridge 接收当前上下文已保存的图片。群聊中的链接作为文本处理。
+- `AGENT_MULTIMODAL=true` 允许视觉模型从 Bridge 接收当前上下文已保存的图片。使用优先级列表时，还需为接收图片的提供方设置 `MULTIMODAL=true`。群聊中的链接作为文本处理。
 - 历史、记忆或图片读取失败时，Agent 可使用其余上下文，发送仍需重新验证目标和就绪状态。紧急触发正文或引用被近期上下文截断时，模型会收到单独的限长触发记录。结构化、工具和纯文本回复使用同一发言内容校验。
 - `AGENT_STATE_PATH` 默认 `data/agent.db`。它保存活跃会话的游标、去重和待处理决策。同一会话重启时继续使用已保存的游标。切换会话后，Agent 从新会话当前最新的持久记录开始，之前的待处理决策会清除，Bridge 的历史仍保存在相应分区。自定义宿主端口时同时设置 `AGENT_BRIDGE_URL`。
 
